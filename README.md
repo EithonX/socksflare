@@ -4,6 +4,12 @@
 
 Route any HTTP(S) request through a SOCKS5 proxy from the Cloudflare Edge — no external relay, no `startTls()`, no JS TLS fallback. TLS is handled entirely by [Rustls](https://github.com/rustls/rustls) compiled to WebAssembly: memory-safe, constant-time, production-grade.
 
+> [!WARNING]
+> **This project is experimental and provided as-is.** It has not undergone a formal security audit. The TLS implementation relies on Rustls WASM, which may have a different fingerprint than standard browsers. **Use at your own risk.** The author(s) make no guarantees regarding security, reliability, or fitness for any particular purpose.
+
+> [!CAUTION]
+> **Disclaimer:** This software is intended for legitimate use cases such as privacy research, bypassing geo-restrictions on your own content, and building developer tools. **The author(s) are not responsible for how this software is used.** By using this software, you agree that you are solely responsible for ensuring your usage complies with all applicable laws and the terms of service of any third-party services you interact with.
+
 ## Why not `startTls()`?
 
 Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Edge, making it unusable for proxied HTTPS connections where the SNI hostname differs from the proxy hostname. This library bypasses that limitation entirely by performing the TLS 1.3 handshake in userspace via Rustls WASM.
@@ -141,6 +147,33 @@ socksflare/
 └── README.md
 ```
 
+## Known Limitations
+
+- **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
+- **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
+- **HTTP/1.1 Only:** The library speaks HTTP/1.1 over the SOCKS5 tunnel. HTTP/2 and HTTP/3 are not supported.
+
+## Contributing
+
+This project was built by someone still learning — contributions, bug fixes, and improvements are very welcome! If you know more about TLS fingerprinting, Rust/WASM optimization, or Cloudflare Workers internals, please open a PR or issue. Every bit helps.
+
+**Areas where help is especially needed:**
+
+- Mimicking real browser TLS fingerprints (JA3/JA4 spoofing in Rustls)
+- HTTP/2 support over SOCKS5
+- Better error handling and retry logic
+- Performance benchmarks and optimization
+
+## Credits
+
+- **[Rustls](https://github.com/rustls/rustls)** — The TLS engine powering the WASM module
+- **[ring](https://github.com/briansmith/ring)** — Cryptographic primitives used by Rustls
+- **[webpki-roots](https://github.com/rustls/webpki-roots)** — Mozilla's root CA certificates
+- **[wasm-bindgen](https://github.com/nicedoc/llvm-builds)** — Rust ↔ JavaScript WASM bridge
+- Built with ❤️ by [EithonX](https://github.com/EithonX)
+
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
+
+**This means:** You can use, modify, and distribute this software freely, but any derivative work must also be released under GPL-3.0. See [LICENSE](LICENSE) for full terms.
