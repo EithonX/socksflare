@@ -117,11 +117,11 @@ function buildHttpRequest(url, init) {
     if (!headers.has('User-Agent')) headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
     if (!headers.has('Accept')) headers.set('Accept', '*/*');
 
-    // Default to identity encoding — the caller can override this if they want
-    // compressed responses (the parser handles gzip/deflate/br).
-    if (!headers.has('Accept-Encoding')) {
-        headers.set('Accept-Encoding', 'identity');
-    }
+    // Force identity encoding unconditionally.
+    // Decompressing gzip/brotli inside a Worker is slow and error-prone.
+    // By forcing identity encoding, the target server sends plain data through the proxy.
+    // Cloudflare's Edge will automatically re-compress the final response for the user.
+    headers.set('Accept-Encoding', 'identity');
 
     // Auto Content-Length for string bodies
     if (init.body && typeof init.body === 'string' && !headers.has('Content-Length')) {
@@ -208,37 +208,11 @@ async function parseResponseBinary(readable, socket) {
 
     if (isChunked) {
         bodyStream = createChunkedStream(reader, bodyRemainder, socket);
+        responseHeaders.delete('transfer-encoding');
     } else if (contentLength !== null && contentLength >= 0) {
         bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket);
     } else {
         bodyStream = createDirectStream(reader, bodyRemainder);
-    }
-
-    // ── Transparent decompression ──
-    const contentEncoding = responseHeaders.get('content-encoding');
-    if (contentEncoding && bodyStream) {
-        const enc = contentEncoding.toLowerCase().trim();
-        try {
-            if (enc === 'gzip' || enc === 'x-gzip') {
-                bodyStream = bodyStream.pipeThrough(new DecompressionStream('gzip'));
-                responseHeaders.delete('content-encoding');
-                responseHeaders.delete('content-length');
-            } else if (enc === 'deflate') {
-                bodyStream = bodyStream.pipeThrough(new DecompressionStream('deflate'));
-                responseHeaders.delete('content-encoding');
-                responseHeaders.delete('content-length');
-            } else if (enc === 'br') {
-                try {
-                    bodyStream = bodyStream.pipeThrough(new DecompressionStream('br'));
-                    responseHeaders.delete('content-encoding');
-                    responseHeaders.delete('content-length');
-                } catch (_) {
-                    // Brotli may not be supported — pass through compressed
-                }
-            }
-        } catch (_) {
-            // Decompression unavailable — pass through raw
-        }
     }
 
     return new Response(bodyStream, { status, statusText, headers: responseHeaders });

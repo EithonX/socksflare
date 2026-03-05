@@ -23,6 +23,7 @@ Any Worker using this library **must** include the following rule in their `wran
 type = "CompiledWasm"
 globs = ["**/*.wasm"]
 fallback = true
+fallthrough = true
 ```
 
 ## Quick Start

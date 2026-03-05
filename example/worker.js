@@ -28,8 +28,13 @@ export default {
         }
 
         try {
+            const proxyHeaders = new Headers(request.headers);
+            proxyHeaders.delete('host');
+
             return await proxy.fetch(url, {
-                headers: { 'Accept-Encoding': 'identity' },
+                method: request.method,
+                headers: Object.fromEntries(proxyHeaders.entries()),
+                body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
             });
         } catch (err) {
             return new Response(`Proxy error: ${err.message}`, {

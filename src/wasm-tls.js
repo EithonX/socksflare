@@ -30,9 +30,11 @@ let wasmInitialized = false;
  */
 export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHostname) {
     if (!wasmInitialized) {
-        initSync(wasmModule);
+        initSync({ module: wasmModule });
         wasmInitialized = true;
     }
+
+    const toError = (err) => err instanceof Error ? err : new Error(String(err));
 
     const client = new WasmTlsClient(tlsHostname);
 
@@ -66,7 +68,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                 client.write_app_data(chunk);
                 await flushNetworkWrites();
             } catch (err) {
-                controller.error(err);
+                controller.error(toError(err));
             }
         },
         close() {
@@ -80,7 +82,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
 
         // Trigger initial ClientHello
         flushNetworkWrites().catch(e => {
-            if (!resolved) { resolved = true; reject(e); }
+            if (!resolved) { resolved = true; reject(toError(e)); }
         });
 
         /**
@@ -116,11 +118,12 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                                 // Break to avoid infinite loop (connection closed or stalled).
                                 if (consumed === 0) break;
                             } catch (err) {
+                                const e = toError(err);
                                 if (!resolved) {
                                     resolved = true;
-                                    return reject(err);
+                                    return reject(e);
                                 } else {
-                                    appReadableController.error(err);
+                                    appReadableController.error(e);
                                 }
                                 return;
                             }
@@ -142,17 +145,18 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                     }
                 }
             } catch (err) {
+                const e = toError(err);
                 if (!resolved) {
                     resolved = true;
-                    reject(err);
+                    reject(e);
                 } else {
-                    try { appReadableController.error(err); } catch (_) { /* noop */ }
+                    try { appReadableController.error(e); } catch (_) { /* noop */ }
                 }
             }
         }
 
         networkPump().catch(e => {
-            if (!resolved) { resolved = true; reject(e); }
+            if (!resolved) { resolved = true; reject(toError(e)); }
         });
     });
 }
