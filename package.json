@@ -1,0 +1,42 @@
+{
+  "name": "socksflare",
+  "version": "0.1.0",
+  "description": "SOCKS5 proxy client for Cloudflare Workers with TLS 1.3 via Rustls WASM",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "rust-tls-wasm/pkg/",
+    "LICENSE",
+    "README.md"
+  ],
+  "author": {
+    "name": "EithonX",
+    "url": "https://github.com/EithonX"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EithonX/socksflare"
+  },
+  "homepage": "https://github.com/EithonX/socksflare#readme",
+  "bugs": {
+    "url": "https://github.com/EithonX/socksflare/issues"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "socks5",
+    "proxy",
+    "tls",
+    "wasm",
+    "rustls",
+    "socksflare"
+  ],
+  "license": "GPL-3.0-or-later",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

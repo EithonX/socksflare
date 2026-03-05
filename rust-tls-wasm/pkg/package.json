@@ -1,0 +1,15 @@
+{
+  "name": "rust-tls-wasm",
+  "type": "module",
+  "version": "0.1.0",
+  "files": [
+    "rust_tls_wasm_bg.wasm",
+    "rust_tls_wasm.js",
+    "rust_tls_wasm.d.ts"
+  ],
+  "main": "rust_tls_wasm.js",
+  "types": "rust_tls_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ]
+}
