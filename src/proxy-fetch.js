@@ -118,12 +118,20 @@ function buildHttpRequest(url, init) {
     headers.set('Host', host);
     if (!headers.has('Connection')) headers.set('Connection', 'close');
 
-    // Strip Cloudflare-specific routing and loop-prevention headers.
-    // Forwarding CF-Ray or CF-Connecting-IP to another CF zone triggers Error 1000.
+    // Strip Cloudflare-specific routing and all proxy-related headers.
+    // This guarantees the SOCKS5 traffic is fully anonymous, even if the Worker blindly forwards the client's original headers.
     const keysToDelete = [];
     for (const key of headers.keys()) {
         const k = key.toLowerCase();
-        if (k.startsWith('cf-') || k.startsWith('x-forwarded-')) {
+        if (
+            k.startsWith('cf-') ||
+            k.startsWith('x-forwarded-') ||
+            k === 'x-real-ip' ||
+            k === 'true-client-ip' ||
+            k === 'forwarded' ||
+            k === 'via' ||
+            k === 'cdn-loop'
+        ) {
             keysToDelete.push(key);
         }
     }
