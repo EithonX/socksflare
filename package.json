@@ -1,6 +1,6 @@
 {
   "name": "socksflare",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "SOCKS5 proxy client for Cloudflare Workers with TLS 1.3 via Rustls WASM",
   "type": "module",
   "main": "src/index.js",
