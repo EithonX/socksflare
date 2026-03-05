@@ -107,13 +107,30 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
 // ─── HTTP Request Builder ───────────────────────────────────────────
 
 function buildHttpRequest(url, init) {
+    // ── Build HTTP Request ──
     const method = (init.method || 'GET').toUpperCase();
     const path = url.pathname + url.search;
     const host = url.port ? `${url.hostname}:${url.port}` : url.hostname;
+    const headers = new Headers(init.headers);
 
-    const headers = new Headers(init.headers || {});
-    if (!headers.has('Host')) headers.set('Host', host);
+    // Ensure Host header is set correctly (prevents Cloudflare domain fronting errors)
+    // Overwrite any Host header that might have been forwarded blindly from the Worker's request.
+    headers.set('Host', host);
     if (!headers.has('Connection')) headers.set('Connection', 'close');
+
+    // Strip Cloudflare-specific routing and loop-prevention headers.
+    // Forwarding CF-Ray or CF-Connecting-IP to another CF zone triggers Error 1000.
+    const keysToDelete = [];
+    for (const key of headers.keys()) {
+        const k = key.toLowerCase();
+        if (k.startsWith('cf-') || k.startsWith('x-forwarded-')) {
+            keysToDelete.push(key);
+        }
+    }
+    for (const key of keysToDelete) {
+        headers.delete(key);
+    }
+
     if (!headers.has('User-Agent')) headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
     if (!headers.has('Accept')) headers.set('Accept', '*/*');
 
