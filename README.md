@@ -83,6 +83,7 @@ const response = await proxy.fetch('https://example.com', {
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
+| `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 with fallback, or require HTTP/2 |
 
 ### `client.connect(targetHost, targetPort, options?)`
 
@@ -103,6 +104,7 @@ await writer.write(new TextEncoder().encode('EHLO example.com\r\n'));
 |-----------|------|---------|-------------|
 | `options.enableTls` | `boolean` | `false` | Upgrade tunnel with TLS 1.3 |
 | `options.tlsHostname` | `string` | `targetHost` | SNI hostname |
+| `options.alpnProtocols` | `string[]` | — | Optional ALPN protocols (for example `['h2', 'http/1.1']`) |
 
 ### Low-level Exports
 
@@ -134,7 +136,8 @@ socksflare/
 ├── src/
 │   ├── index.js             ← Main export: Socks5Client class
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
-│   ├── proxy-fetch.js       ← HTTP/1.1 response parser
+│   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
+│   ├── proxy-fetch-http2.js ← Experimental HTTP/2 path
 │   └── wasm-tls.js          ← JS bridge to Rustls WASM
 ├── rust-tls-wasm/
 │   ├── src/lib.rs           ← Rustls WasmTlsClient
@@ -151,7 +154,9 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
-- **HTTP/1.1 Only:** The library speaks HTTP/1.1 over the SOCKS5 tunnel. HTTP/2 and HTTP/3 are not supported.
+- **HTTP/2 Is Experimental:** `proxy.fetch()` supports an experimental HTTP/2 mode (`options.httpVersion = 'auto'` or `'2'`) designed for single-stream usage and graceful fallback.
+- **HTTP/2 Compatibility Is In Progress:** Some servers may still fail the experimental HTTP/2 path (for example due advanced HPACK/header encoding behavior). Use `httpVersion: 'auto'` for fallback-friendly rollout.
+- **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library.
 
 ## Contributing
 

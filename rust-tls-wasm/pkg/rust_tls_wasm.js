@@ -30,12 +30,27 @@ export class WasmTlsClient {
         return ret !== 0;
     }
     /**
-     * @param {string} hostname
+     * @returns {string | undefined}
      */
-    constructor(hostname) {
+    negotiatedAlpn() {
+        const ret = wasm.wasmtlsclient_negotiatedAlpn(this.__wbg_ptr);
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * @param {string} hostname
+     * @param {string | null} [alpn_csv]
+     */
+    constructor(hostname, alpn_csv) {
         const ptr0 = passStringToWasm0(hostname, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmtlsclient_new(ptr0, len0);
+        var ptr1 = isLikeNone(alpn_csv) ? 0 : passStringToWasm0(alpn_csv, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        var len1 = WASM_VECTOR_LEN;
+        const ret = wasm.wasmtlsclient_new(ptr0, len0, ptr1, len1);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }

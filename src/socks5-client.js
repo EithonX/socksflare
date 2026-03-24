@@ -154,7 +154,8 @@ function ipv6ToBytes(ipv6) {
  * @param {Object} [options] - Connection options.
  * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS via Rustls WASM.
  * @param {string} [options.tlsHostname] - SNI hostname for TLS (defaults to targetHost).
- * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream}>}
+ * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+ * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
  */
 export async function socks5Connect(proxyConfig, targetHost, targetPort, options = {}) {
   const { hostname: proxyHost, port: proxyPort = 1080, username, password } = proxyConfig;
@@ -172,6 +173,7 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
   const useAuth = !!(username && password);
   const enableTls = options.enableTls || false;
   const tlsHostname = options.tlsHostname || targetHost;
+  const alpnProtocols = Array.isArray(options.alpnProtocols) ? options.alpnProtocols : undefined;
 
   // Connect to SOCKS5 proxy over plain TCP — always unencrypted at this layer.
   const socket = connect({ hostname: proxyHost, port: proxyPort });
@@ -261,7 +263,10 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
 
     // ── TLS Upgrade via Rustls WASM ──
     if (enableTls) {
-      return await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname);
+      const tlsTunnel = await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname, {
+        alpnProtocols,
+      });
+      return { socket, ...tlsTunnel };
     }
 
     return { socket, readable: socket.readable, writable: socket.writable };

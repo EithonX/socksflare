@@ -9,7 +9,8 @@ export class WasmTlsClient {
      */
     extract_network_data(): Uint8Array;
     is_handshaking(): boolean;
-    constructor(hostname: string);
+    negotiatedAlpn(): string | undefined;
+    constructor(hostname: string, alpn_csv?: string | null);
     /**
      * Feeds raw TCP bytes from the SOCKS5 proxy into the Rustls state machine.
      * Returns the number of bytes consumed.
@@ -34,7 +35,8 @@ export interface InitOutput {
     readonly __wbg_wasmtlsclient_free: (a: number, b: number) => void;
     readonly wasmtlsclient_extract_network_data: (a: number) => [number, number, number];
     readonly wasmtlsclient_is_handshaking: (a: number) => number;
-    readonly wasmtlsclient_new: (a: number, b: number) => [number, number, number];
+    readonly wasmtlsclient_negotiatedAlpn: (a: number) => [number, number];
+    readonly wasmtlsclient_new: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly wasmtlsclient_provide_network_data: (a: number, b: number, c: number) => [number, number, number];
     readonly wasmtlsclient_read_app_data: (a: number) => [number, number, number];
     readonly wasmtlsclient_wants_read: (a: number) => number;
@@ -45,6 +47,7 @@ export interface InitOutput {
     readonly __externref_table_alloc: () => number;
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __externref_table_dealloc: (a: number) => void;
+    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_start: () => void;

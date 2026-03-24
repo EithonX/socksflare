@@ -1,5 +1,7 @@
 /**
- * HTTP/1.1 fetch over a SOCKS5 tunnel for Cloudflare Workers.
+ * Fetch over a SOCKS5 tunnel for Cloudflare Workers.
+ *
+ * Default path is HTTP/1.1, with optional experimental HTTP/2 dispatch.
  *
  * Handles:
  * - Content-Length based responses (exact byte read, no TCP-close wait)
@@ -12,6 +14,7 @@
  */
 
 import { socks5Connect } from './socks5-client.js';
+import { proxyFetchHttp2 } from './proxy-fetch-http2.js';
 
 const CR = 0x0D;
 const LF = 0x0A;
@@ -26,6 +29,7 @@ const LF = 0x0A;
  * @param {Object} proxyConfig - SOCKS5 proxy config (hostname, port, username, password).
  * @param {Object} [options] - Extra options.
  * @param {string} [options.tlsHostname] - Override SNI hostname for TLS.
+ * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
  * @returns {Promise<Response>}
  */
 export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
@@ -45,6 +49,28 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
     }
 
     const isHttps = url.protocol === 'https:';
+    const requestedVersion = options.httpVersion === '2'
+        ? '2'
+        : (options.httpVersion === 'auto' ? 'auto' : '1.1');
+
+    if (isHttps && requestedVersion !== '1.1') {
+        try {
+            return await proxyFetchHttp2(url, requestInit, proxyConfig, {
+                tlsHostname: options.tlsHostname,
+            });
+        } catch (err) {
+            if (requestedVersion === '2') {
+                throw err;
+            }
+            // auto mode: fall through to HTTP/1.1 path
+        }
+    }
+
+    return proxyFetchHttp11(url, requestInit, proxyConfig, options);
+}
+
+async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
+    const isHttps = url.protocol === 'https:';
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port) || (isHttps ? 443 : 80);
     const tlsHostname = options.tlsHostname || targetHost;
@@ -53,6 +79,7 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
     const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
         enableTls: isHttps,
         tlsHostname,
+        alpnProtocols: isHttps ? ['http/1.1'] : undefined,
     });
 
     try {

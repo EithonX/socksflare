@@ -25,18 +25,24 @@ let wasmInitialized = false;
  * @param {ReadableStream} networkReadable - Raw TCP readable (from SOCKS5 tunnel).
  * @param {WritableStream} networkWritable - Raw TCP writable (from SOCKS5 tunnel).
  * @param {string} tlsHostname - SNI hostname for the TLS handshake.
- * @returns {Promise<{readable: ReadableStream, writable: WritableStream}>}
+ * @param {Object} [options] - TLS handshake options.
+ * @param {string[]} [options.alpnProtocols] - ALPN protocol list in preference order.
+ * @returns {Promise<{readable: ReadableStream, writable: WritableStream, alpnProtocol: string|null}>}
  *   Application-layer streams carrying decrypted data.
  */
-export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHostname) {
+export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHostname, options = {}) {
     if (!wasmInitialized) {
         initSync({ module: wasmModule });
         wasmInitialized = true;
     }
 
     const toError = (err) => err instanceof Error ? err : new Error(String(err));
+    const alpnProtocols = Array.isArray(options.alpnProtocols)
+        ? options.alpnProtocols.map(p => String(p).trim()).filter(Boolean)
+        : [];
+    const alpnCsv = alpnProtocols.join(',');
 
-    const client = new WasmTlsClient(tlsHostname);
+    const client = new WasmTlsClient(tlsHostname, alpnCsv || undefined);
 
     // Application-layer readable stream (decrypted data for the caller)
     let appReadableController = null;
@@ -133,7 +139,10 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                             // Resolve on handshake completion
                             if (!client.is_handshaking() && !resolved) {
                                 resolved = true;
-                                resolve({ readable: appReadable, writable: appWritable });
+                                const alpnProtocol = typeof client.negotiatedAlpn === 'function'
+                                    ? (client.negotiatedAlpn() || null)
+                                    : null;
+                                resolve({ readable: appReadable, writable: appWritable, alpnProtocol });
                             }
 
                             // Read any decrypted application data

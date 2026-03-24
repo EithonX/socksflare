@@ -61,11 +61,13 @@ export class Socks5Client {
      * @param {RequestInit} [init] - Standard fetch init options.
      * @param {Object} [options] - Additional options.
      * @param {string} [options.tlsHostname] - Override SNI hostname for TLS.
+     * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
      * @returns {Promise<Response>}
      */
     async fetch(input, init = {}, options = {}) {
         return proxyFetch(input, init, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
+            httpVersion: options.httpVersion,
         });
     }
 
@@ -77,12 +79,14 @@ export class Socks5Client {
      * @param {Object} [options] - Connection options.
      * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS 1.3.
      * @param {string} [options.tlsHostname] - SNI hostname (defaults to targetHost).
-     * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream}>}
+     * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+     * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
      */
     async connect(targetHost, targetPort, options = {}) {
         return socks5Connect(this._proxyConfig, targetHost, targetPort, {
             enableTls: options.enableTls || false,
             tlsHostname: options.tlsHostname || targetHost,
+            alpnProtocols: options.alpnProtocols,
         });
     }
 }
