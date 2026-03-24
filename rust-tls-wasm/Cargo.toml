@@ -1,7 +1,8 @@
 [package]
 name = "rust-tls-wasm"
-version = "0.1.0"
-edition = "2021"
+version = "0.1.1"
+authors = ["EithonX"]
+edition = "2024"
 
 [lib]
 crate-type = ["cdylib"]
@@ -12,5 +13,5 @@ js-sys = "0.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 rustls-pki-types = { version = "1.14", features = ["web", "std"] }
-webpki-roots = "0.26"
+webpki-roots = "1"
 getrandom = { version = "0.2", features = ["js"] }

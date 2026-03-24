@@ -1,7 +1,10 @@
 {
   "name": "rust-tls-wasm",
   "type": "module",
-  "version": "0.1.0",
+  "collaborators": [
+    "EithonX"
+  ],
+  "version": "0.1.1",
   "files": [
     "rust_tls_wasm_bg.wasm",
     "rust_tls_wasm.js",
