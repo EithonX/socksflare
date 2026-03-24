@@ -1,0 +1,6 @@
+*
+!package.json
+!rust_tls_wasm.js
+!rust_tls_wasm.d.ts
+!rust_tls_wasm_bg.wasm
+!rust_tls_wasm_bg.wasm.d.ts
