@@ -103,6 +103,31 @@ const HPACK_STATIC_TABLE = [
     ['www-authenticate', ''],
 ];
 
+const HPACK_HUFFMAN_EOS = 256;
+
+// RFC 7541 Appendix B. Code lengths indexed by symbol [0..256] (EOS at 256).
+const HPACK_HUFFMAN_CODE_LENGTHS = [
+    13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
+    28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+    6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6,
+    5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+    13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+    7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+    15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5,
+    6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+    20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23,
+    24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+    22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23,
+    21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+    26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25,
+    19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+    20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23,
+    26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+    30,
+];
+
+const HPACK_HUFFMAN_DECODE_TREE = buildHpackHuffmanDecodeTree();
+
 export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, options = {}) {
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port, 10) || 443;
@@ -145,13 +170,12 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
             await writeDataStream(frameWriter, streamId, bodyMode.stream);
         }
 
-        const response = await readResponse(frameReader, frameWriter, streamId, hpackDecoder);
-
-        try { await tunnel.socket.close(); } catch (_) { /* noop */ }
-        return response;
-    } finally {
+        return await readResponse(frameReader, frameWriter, streamId, hpackDecoder, tunnel.socket);
+    } catch (err) {
         try { frameReader.releaseLock(); } catch (_) { /* noop */ }
         try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
+        try { await tunnel.socket.close(); } catch (_) { /* noop */ }
+        throw err;
     }
 }
 
@@ -310,17 +334,13 @@ class HpackDecoder {
     }
 }
 
-async function readResponse(frameReader, frameWriter, streamId, hpackDecoder) {
+async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, socket) {
     const headers = new Headers();
     let status = 200;
     let statusSeen = false;
     let streamEnded = false;
-
-    let headerFragments = [];
-    let awaitingContinuation = false;
-
-    const bodyChunks = [];
-    let bodyLength = 0;
+    let responseHeadersComplete = false;
+    const initialBodyChunks = [];
 
     while (!streamEnded) {
         const frame = await frameReader.readFrame();
@@ -335,47 +355,40 @@ async function readResponse(frameReader, frameWriter, streamId, hpackDecoder) {
         }
 
         if (frame.type === FRAME_HEADERS) {
-            const parsed = parseHeadersPayload(frame.payload, frame.flags);
-            headerFragments = [parsed.fragment];
-            awaitingContinuation = !parsed.endHeaders;
+            const block = await collectHeaderBlock(frameReader, frameWriter, streamId, frame);
+            const decoded = hpackDecoder.decode(block.headerBlock);
 
-            if (parsed.endHeaders) {
-                const decoded = hpackDecoder.decode(concatChunks(headerFragments));
-                applyDecodedHeaders(decoded, headers, (code) => {
-                    status = code;
+            if (!responseHeadersComplete) {
+                const parsedStatus = getStatusFromDecoded(decoded);
+                if (parsedStatus >= 100 && parsedStatus < 200 && parsedStatus !== 101) {
+                    // Informational response block (e.g. 100 Continue), keep waiting for final headers.
+                    continue;
+                }
+
+                if (parsedStatus > 0) {
+                    status = parsedStatus;
                     statusSeen = true;
-                });
-                headerFragments = [];
+                }
+                applyRegularHeaders(decoded, headers);
+                responseHeadersComplete = true;
+            } else {
+                // Trailers: append only regular headers.
+                applyTrailerHeaders(decoded, headers);
             }
 
-            if (parsed.endStream) {
+            if (block.endStream) {
                 streamEnded = true;
             }
             continue;
         }
 
-        if (frame.type === FRAME_CONTINUATION) {
-            if (!awaitingContinuation) {
-                throw new Error('HTTP/2: unexpected CONTINUATION');
-            }
-            headerFragments.push(frame.payload);
-            if ((frame.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS) {
-                const decoded = hpackDecoder.decode(concatChunks(headerFragments));
-                applyDecodedHeaders(decoded, headers, (code) => {
-                    status = code;
-                    statusSeen = true;
-                });
-                headerFragments = [];
-                awaitingContinuation = false;
-            }
-            continue;
-        }
-
         if (frame.type === FRAME_DATA) {
+            if (!responseHeadersComplete) {
+                throw new Error('HTTP/2: DATA received before response HEADERS');
+            }
             const parsed = parseDataPayload(frame.payload, frame.flags);
             if (parsed.data.byteLength > 0) {
-                bodyChunks.push(parsed.data);
-                bodyLength += parsed.data.byteLength;
+                initialBodyChunks.push(parsed.data);
 
                 await sendWindowUpdate(frameWriter, 0, parsed.data.byteLength);
                 await sendWindowUpdate(frameWriter, streamId, parsed.data.byteLength);
@@ -400,8 +413,24 @@ async function readResponse(frameReader, frameWriter, streamId, hpackDecoder) {
         throw new Error('HTTP/2: response missing :status pseudo-header');
     }
 
-    const body = bodyLength > 0 ? concatBody(bodyChunks, bodyLength) : null;
-    return new Response(body, { status, headers });
+    if (streamEnded && initialBodyChunks.length === 0) {
+        try { frameReader.releaseLock(); } catch (_) { /* noop */ }
+        try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
+        try { await socket.close(); } catch (_) { /* noop */ }
+        return new Response(null, { status, headers });
+    }
+
+    const bodyStream = createHttp2BodyStream({
+        frameReader,
+        frameWriter,
+        streamId,
+        hpackDecoder,
+        headers,
+        initialBodyChunks,
+        streamEnded,
+        socket,
+    });
+    return new Response(bodyStream, { status, headers });
 }
 
 async function handleConnectionFrame(frameWriter, frame) {
@@ -430,21 +459,165 @@ async function handleConnectionFrame(frameWriter, frame) {
     // Ignore WINDOW_UPDATE and other connection-level frames we do not need for now.
 }
 
-function applyDecodedHeaders(decoded, headers, setStatus) {
+function getStatusFromDecoded(decoded) {
     for (const [name, value] of decoded) {
         if (!name) continue;
+        if (name !== ':status') continue;
+        const code = parseInt(value, 10);
+        if (!Number.isNaN(code)) return code;
+    }
+    return 0;
+}
 
-        if (name[0] === ':') {
-            if (name === ':status') {
-                const code = parseInt(value, 10);
-                if (!Number.isNaN(code)) setStatus(code);
-            }
+function applyRegularHeaders(decoded, headers) {
+    for (const [name, value] of decoded) {
+        if (!name || name[0] === ':' || value == null) continue;
+        headers.append(name, value);
+    }
+}
+
+function applyTrailerHeaders(decoded, headers) {
+    for (const [name, value] of decoded) {
+        if (!name || name[0] === ':' || value == null) continue;
+        headers.append(name, value);
+    }
+}
+
+async function collectHeaderBlock(frameReader, frameWriter, streamId, firstHeadersFrame) {
+    const parsed = parseHeadersPayload(firstHeadersFrame.payload, firstHeadersFrame.flags);
+    const fragments = [parsed.fragment];
+
+    if (parsed.endHeaders) {
+        return { headerBlock: concatChunks(fragments), endStream: parsed.endStream };
+    }
+
+    while (true) {
+        const frame = await frameReader.readFrame();
+
+        if (frame.streamId === 0) {
+            await handleConnectionFrame(frameWriter, frame);
             continue;
         }
 
-        if (value == null) continue;
-        headers.append(name, value);
+        if (frame.streamId !== streamId || frame.type !== FRAME_CONTINUATION) {
+            throw new Error('HTTP/2: invalid continuation sequence');
+        }
+
+        fragments.push(frame.payload);
+        if ((frame.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS) {
+            return { headerBlock: concatChunks(fragments), endStream: parsed.endStream };
+        }
     }
+}
+
+function createHttp2BodyStream({
+    frameReader,
+    frameWriter,
+    streamId,
+    hpackDecoder,
+    headers,
+    initialBodyChunks,
+    streamEnded,
+    socket,
+}) {
+    const queue = [...initialBodyChunks];
+    let done = streamEnded;
+    let reading = false;
+    let cleanedUp = false;
+
+    async function cleanup() {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        try { frameReader.releaseLock(); } catch (_) { /* noop */ }
+        try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
+        try { await socket.close(); } catch (_) { /* noop */ }
+    }
+
+    async function readUntilChunkOrDone(controller) {
+        while (!done) {
+            const frame = await frameReader.readFrame();
+
+            if (frame.streamId === 0) {
+                await handleConnectionFrame(frameWriter, frame);
+                continue;
+            }
+
+            if (frame.streamId !== streamId) {
+                continue;
+            }
+
+            if (frame.type === FRAME_DATA) {
+                const parsed = parseDataPayload(frame.payload, frame.flags);
+                if (parsed.data.byteLength > 0) {
+                    await sendWindowUpdate(frameWriter, 0, parsed.data.byteLength);
+                    await sendWindowUpdate(frameWriter, streamId, parsed.data.byteLength);
+                    controller.enqueue(parsed.data);
+                }
+                if (parsed.endStream) {
+                    done = true;
+                }
+                return;
+            }
+
+            if (frame.type === FRAME_HEADERS) {
+                // Trailer headers.
+                const block = await collectHeaderBlock(frameReader, frameWriter, streamId, frame);
+                const decoded = hpackDecoder.decode(block.headerBlock);
+                applyTrailerHeaders(decoded, headers);
+                if (block.endStream) {
+                    done = true;
+                }
+                continue;
+            }
+
+            if (frame.type === FRAME_RST_STREAM) {
+                throw new Error('HTTP/2: stream reset by peer');
+            }
+
+            if (frame.type === FRAME_GOAWAY) {
+                throw new Error('HTTP/2: peer sent GOAWAY');
+            }
+        }
+    }
+
+    return new ReadableStream({
+        async pull(controller) {
+            if (queue.length > 0) {
+                controller.enqueue(queue.shift());
+                if (queue.length === 0 && done) {
+                    controller.close();
+                    await cleanup();
+                }
+                return;
+            }
+
+            if (done) {
+                controller.close();
+                await cleanup();
+                return;
+            }
+
+            if (reading) return;
+            reading = true;
+            try {
+                await readUntilChunkOrDone(controller);
+                if (done) {
+                    controller.close();
+                    await cleanup();
+                }
+            } catch (err) {
+                done = true;
+                controller.error(err);
+                await cleanup();
+            } finally {
+                reading = false;
+            }
+        },
+        async cancel() {
+            done = true;
+            await cleanup();
+        },
+    });
 }
 
 function parseHeadersPayload(payload, flags) {
@@ -659,12 +832,97 @@ function decodeHpackString(buf, offset) {
     const bytes = buf.subarray(offset, offset + length);
     offset += length;
 
-    // This experimental implementation does not decode HPACK Huffman yet.
     if (huffman) {
-        return { value: '', nextOffset: offset };
+        return { value: decodeHpackHuffman(bytes), nextOffset: offset };
     }
 
     return { value: decoder.decode(bytes), nextOffset: offset };
+}
+
+function buildHpackHuffmanDecodeTree() {
+    const root = createHpackHuffmanNode();
+    const symbols = [];
+
+    for (let sym = 0; sym < HPACK_HUFFMAN_CODE_LENGTHS.length; sym++) {
+        symbols.push({ sym, len: HPACK_HUFFMAN_CODE_LENGTHS[sym] });
+    }
+    symbols.sort((a, b) => (a.len - b.len) || (a.sym - b.sym));
+
+    let code = 0;
+    let prevLen = 0;
+
+    for (const { sym, len } of symbols) {
+        code <<= (len - prevLen);
+        insertHpackHuffmanCode(root, code, len, sym);
+        code += 1;
+        prevLen = len;
+    }
+    return root;
+}
+
+function createHpackHuffmanNode() {
+    return { zero: null, one: null, sym: -1 };
+}
+
+function insertHpackHuffmanCode(root, code, len, sym) {
+    let node = root;
+    for (let i = len - 1; i >= 0; i--) {
+        const bit = (code >>> i) & 1;
+        if (bit === 0) {
+            if (!node.zero) node.zero = createHpackHuffmanNode();
+            node = node.zero;
+        } else {
+            if (!node.one) node.one = createHpackHuffmanNode();
+            node = node.one;
+        }
+    }
+
+    if (node.sym !== -1) {
+        throw new Error('HTTP/2 HPACK: duplicate Huffman symbol in decode tree');
+    }
+    if (node.zero || node.one) {
+        throw new Error('HTTP/2 HPACK: invalid Huffman tree insertion');
+    }
+    node.sym = sym;
+}
+
+function decodeHpackHuffman(bytes) {
+    const decoded = [];
+    let node = HPACK_HUFFMAN_DECODE_TREE;
+    let bitsSinceSymbol = 0;
+    let trailingOnes = 0;
+
+    for (let i = 0; i < bytes.byteLength; i++) {
+        const b = bytes[i];
+        for (let bitPos = 7; bitPos >= 0; bitPos--) {
+            const bit = (b >> bitPos) & 1;
+            node = bit === 0 ? node.zero : node.one;
+            if (!node) {
+                throw new Error('HTTP/2 HPACK: invalid Huffman code');
+            }
+
+            bitsSinceSymbol += 1;
+            trailingOnes = bit === 1 ? (trailingOnes + 1) : 0;
+
+            if (node.sym !== -1) {
+                if (node.sym === HPACK_HUFFMAN_EOS) {
+                    throw new Error('HTTP/2 HPACK: EOS symbol is not allowed in string literal');
+                }
+                decoded.push(node.sym);
+                node = HPACK_HUFFMAN_DECODE_TREE;
+                bitsSinceSymbol = 0;
+                trailingOnes = 0;
+            }
+        }
+    }
+
+    if (node !== HPACK_HUFFMAN_DECODE_TREE) {
+        if (bitsSinceSymbol > 7 || trailingOnes !== bitsSinceSymbol) {
+            throw new Error('HTTP/2 HPACK: invalid Huffman padding');
+        }
+    }
+
+    return decoder.decode(Uint8Array.from(decoded));
 }
 
 async function writeHeaderBlock(writer, streamId, headerBlock, endStream) {
@@ -771,18 +1029,6 @@ function buildFrame(type, flags, streamId, payload) {
     out[7] = (streamId >> 8) & 0xff;
     out[8] = streamId & 0xff;
     out.set(payload, 9);
-    return out;
-}
-
-function concatBody(chunks, totalLength) {
-    if (chunks.length === 0) return new Uint8Array(0);
-    if (chunks.length === 1) return chunks[0];
-    const out = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const c of chunks) {
-        out.set(c, offset);
-        offset += c.byteLength;
-    }
     return out;
 }
 
