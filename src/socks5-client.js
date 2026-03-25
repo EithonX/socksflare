@@ -100,7 +100,11 @@ function parseAddress(host) {
   const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
   if (ipv4Match) {
     const bytes = new Uint8Array(4);
-    for (let i = 0; i < 4; i++) bytes[i] = parseInt(ipv4Match[i + 1], 10);
+    for (let i = 0; i < 4; i++) {
+      const octet = parseInt(ipv4Match[i + 1], 10);
+      if (octet > 255) throw new Error(`SOCKS5: invalid IPv4 octet: ${octet}`);
+      bytes[i] = octet;
+    }
     return { atyp: ATYP_IPV4, addressBytes: bytes };
   }
 
@@ -144,6 +148,10 @@ function ipv6ToBytes(ipv6) {
 /**
  * Establishes a SOCKS5 tunnel to the target host through a proxy.
  *
+ * **Security note:** The connection to the SOCKS5 proxy is always plain TCP.
+ * Username/password authentication (RFC 1929) is sent **unencrypted**.
+ * Only use with trusted/localhost proxies, or add your own encryption layer.
+ *
  * @param {Object} proxyConfig - Proxy connection details.
  * @param {string} proxyConfig.hostname - SOCKS5 proxy hostname.
  * @param {number} [proxyConfig.port=1080] - SOCKS5 proxy port.
@@ -154,7 +162,8 @@ function ipv6ToBytes(ipv6) {
  * @param {Object} [options] - Connection options.
  * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS via Rustls WASM.
  * @param {string} [options.tlsHostname] - SNI hostname for TLS (defaults to targetHost).
- * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream}>}
+ * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+ * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
  */
 export async function socks5Connect(proxyConfig, targetHost, targetPort, options = {}) {
   const { hostname: proxyHost, port: proxyPort = 1080, username, password } = proxyConfig;
@@ -172,6 +181,7 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
   const useAuth = !!(username && password);
   const enableTls = options.enableTls || false;
   const tlsHostname = options.tlsHostname || targetHost;
+  const alpnProtocols = Array.isArray(options.alpnProtocols) ? options.alpnProtocols : undefined;
 
   // Connect to SOCKS5 proxy over plain TCP — always unencrypted at this layer.
   const socket = connect({ hostname: proxyHost, port: proxyPort });
@@ -261,7 +271,10 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
 
     // ── TLS Upgrade via Rustls WASM ──
     if (enableTls) {
-      return await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname);
+      const tlsTunnel = await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname, {
+        alpnProtocols,
+      });
+      return { socket, ...tlsTunnel };
     }
 
     return { socket, readable: socket.readable, writable: socket.writable };

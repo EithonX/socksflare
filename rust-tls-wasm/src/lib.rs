@@ -12,13 +12,14 @@ pub struct WasmTlsClient {
 #[wasm_bindgen]
 impl WasmTlsClient {
     #[wasm_bindgen(constructor)]
-    pub fn new(hostname: &str) -> Result<WasmTlsClient, JsValue> {
+    pub fn new(hostname: &str, alpn_csv: Option<String>) -> Result<WasmTlsClient, JsValue> {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         
-        let config = ClientConfig::builder()
+        let mut config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
+        config.alpn_protocols = parse_alpn_protocols(alpn_csv)?;
             
         let server_name = ServerName::try_from(hostname.to_string())
             .map_err(|e| JsValue::from_str(&format!("Invalid hostname: {}", e)))?
@@ -86,4 +87,32 @@ impl WasmTlsClient {
     pub fn wants_write(&self) -> bool {
         self.conn.wants_write()
     }
+
+    #[wasm_bindgen(js_name = negotiatedAlpn)]
+    pub fn negotiated_alpn(&self) -> Option<String> {
+        self.conn
+            .alpn_protocol()
+            .map(|p| String::from_utf8_lossy(p).to_string())
+    }
+}
+
+fn parse_alpn_protocols(alpn_csv: Option<String>) -> Result<Vec<Vec<u8>>, JsValue> {
+    let mut parsed = Vec::new();
+
+    if let Some(csv) = alpn_csv {
+        for proto in csv.split(',') {
+            let p = proto.trim();
+            if p.is_empty() {
+                continue;
+            }
+
+            if !p.is_ascii() {
+                return Err(JsValue::from_str("ALPN protocol names must be ASCII"));
+            }
+
+            parsed.push(p.as_bytes().to_vec());
+        }
+    }
+
+    Ok(parsed)
 }

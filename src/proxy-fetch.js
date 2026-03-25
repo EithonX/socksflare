@@ -1,5 +1,7 @@
 /**
- * HTTP/1.1 fetch over a SOCKS5 tunnel for Cloudflare Workers.
+ * Fetch over a SOCKS5 tunnel for Cloudflare Workers.
+ *
+ * Default path is HTTP/1.1, with optional experimental HTTP/2 dispatch.
  *
  * Handles:
  * - Content-Length based responses (exact byte read, no TCP-close wait)
@@ -12,9 +14,16 @@
  */
 
 import { socks5Connect } from './socks5-client.js';
+import { proxyFetchHttp2 } from './proxy-fetch-http2.js';
 
 const CR = 0x0D;
 const LF = 0x0A;
+
+// Security limits — tuned for Cloudflare Workers (128MB memory ceiling)
+const MAX_HEADER_SIZE = 128 * 1024;          // 128KB max response headers
+const MAX_RESPONSE_HEADERS = 200;            // max individual header lines
+const MAX_HEADER_LINE_LENGTH = 8192;         // 8KB per header line
+const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
 
 // ─── Main Export ────────────────────────────────────────────────────
 
@@ -26,6 +35,7 @@ const LF = 0x0A;
  * @param {Object} proxyConfig - SOCKS5 proxy config (hostname, port, username, password).
  * @param {Object} [options] - Extra options.
  * @param {string} [options.tlsHostname] - Override SNI hostname for TLS.
+ * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
  * @returns {Promise<Response>}
  */
 export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
@@ -45,6 +55,29 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
     }
 
     const isHttps = url.protocol === 'https:';
+    const requestedVersion = options.httpVersion === '2'
+        ? '2'
+        : (options.httpVersion === 'auto' ? 'auto' : '1.1');
+
+    if (isHttps && requestedVersion !== '1.1') {
+        try {
+            return await proxyFetchHttp2(url, requestInit, proxyConfig, {
+                tlsHostname: options.tlsHostname,
+                http2Pool: options.http2Pool,
+            });
+        } catch (err) {
+            if (requestedVersion === '2') {
+                throw err;
+            }
+            // auto mode: fall through to HTTP/1.1 path
+        }
+    }
+
+    return proxyFetchHttp11(url, requestInit, proxyConfig, options);
+}
+
+async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
+    const isHttps = url.protocol === 'https:';
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port) || (isHttps ? 443 : 80);
     const tlsHostname = options.tlsHostname || targetHost;
@@ -53,6 +86,7 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
     const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
         enableTls: isHttps,
         tlsHostname,
+        alpnProtocols: isHttps ? ['http/1.1'] : undefined,
     });
 
     try {
@@ -109,6 +143,9 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
 function buildHttpRequest(url, init) {
     // ── Build HTTP Request ──
     const method = (init.method || 'GET').toUpperCase();
+    if (!/^[A-Z]+$/.test(method)) {
+        throw new Error(`Invalid HTTP method: ${method}`);
+    }
     const path = url.pathname + url.search;
     const host = url.port ? `${url.hostname}:${url.port}` : url.hostname;
     const headers = new Headers(init.headers);
@@ -168,7 +205,7 @@ async function parseResponseBinary(readable, socket) {
     const reader = readable.getReader();
     const decoder = new TextDecoder();
 
-    // Accumulate bytes until we find \r\n\r\n
+    // Accumulate bytes until we find \r\n\r\n (bounded to prevent memory DoS)
     let buffers = [];
     let totalLen = 0;
     let headerEndOffset = -1;
@@ -188,6 +225,10 @@ async function parseResponseBinary(readable, socket) {
         buffers.push(value);
         totalLen += value.byteLength;
 
+        if (totalLen > MAX_HEADER_SIZE) {
+            throw new Error(`HTTP response headers too large (>${MAX_HEADER_SIZE} bytes)`);
+        }
+
         combined = concatBuffers(buffers, totalLen);
         headerEndOffset = findHeaderEnd(combined);
     }
@@ -205,13 +246,23 @@ async function parseResponseBinary(readable, socket) {
     const statusText = statusMatch[2] || '';
 
     const responseHeaders = new Headers();
+    let headerCount = 0;
     for (let i = 1; i < lines.length; i++) {
+        if (++headerCount > MAX_RESPONSE_HEADERS) {
+            throw new Error(`Too many response headers (>${MAX_RESPONSE_HEADERS})`);
+        }
+        if (lines[i].length > MAX_HEADER_LINE_LENGTH) {
+            throw new Error(`Response header line too long (>${MAX_HEADER_LINE_LENGTH})`);
+        }
         const idx = lines[i].indexOf(':');
         if (idx > 0) {
-            responseHeaders.append(
-                lines[i].substring(0, idx).trim(),
-                lines[i].substring(idx + 1).trim()
-            );
+            const name = lines[i].substring(0, idx).trim();
+            const value = lines[i].substring(idx + 1).trim();
+            // RFC 7230 §3.2.6: reject header names with non-token characters
+            if (!/^[\x21-\x7E]+$/.test(name)) continue;
+            // Strip control characters from values (null bytes, etc.)
+            const safeValue = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+            responseHeaders.append(name, safeValue);
         }
     }
 
@@ -325,7 +376,7 @@ function createChunkedStream(reader, initialData, socket) {
                 const sizeStr = new TextDecoder().decode(buffer.subarray(0, lineEnd)).trim();
                 const chunkSize = parseInt(sizeStr.split(';')[0], 16);
 
-                if (isNaN(chunkSize) || chunkSize < 0) {
+                if (isNaN(chunkSize) || chunkSize < 0 || chunkSize > MAX_CHUNK_SIZE) {
                     streamDone = true; controller.close(); return;
                 }
 

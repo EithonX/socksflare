@@ -15,3 +15,13 @@ ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
 rustls-pki-types = { version = "1.14", features = ["web", "std"] }
 webpki-roots = "1"
 getrandom = { version = "0.2", features = ["js"] }
+
+[profile.release]
+opt-level = 'z'     # Optimize for strictly for payload size
+lto = true          # Enable Link Time Optimization (huge size reduction)
+codegen-units = 1   # Reduce parallel code generation to optimize LTO mathematically
+panic = 'abort'     # Abort on panic instead of unrolling stack traces (massive size savings)
+strip = true        # Automatically strip internal debug symbols
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false

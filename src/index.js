@@ -42,6 +42,7 @@ export class Socks5Client {
         this.port = parseInt(config.port) || 1080;
         this.username = config.username || config.user || undefined;
         this.password = config.password || config.pass || undefined;
+        this._http2Pool = new Map();
     }
 
     /** @internal */
@@ -58,31 +59,52 @@ export class Socks5Client {
      * Drop-in replacement for `fetch()` — routes through SOCKS5 + Rustls WASM TLS.
      *
      * @param {string|URL|Request} input - URL or Request object.
-     * @param {RequestInit} [init] - Standard fetch init options.
+     * @param {RequestInit} [init] - Standard fetch init options (supports `init.signal`).
      * @param {Object} [options] - Additional options.
      * @param {string} [options.tlsHostname] - Override SNI hostname for TLS.
+     * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
+     * @param {number} [options.timeoutMs] - Abort after this many ms (merged with init.signal if present).
      * @returns {Promise<Response>}
      */
     async fetch(input, init = {}, options = {}) {
-        return proxyFetch(input, init, this._proxyConfig, {
+        const mergedInit = { ...init };
+
+        // H5: Merge user signal with optional timeout
+        if (options.timeoutMs && typeof AbortSignal.timeout === 'function') {
+            const timeoutSignal = AbortSignal.timeout(options.timeoutMs);
+            if (mergedInit.signal && typeof AbortSignal.any === 'function') {
+                mergedInit.signal = AbortSignal.any([mergedInit.signal, timeoutSignal]);
+            } else {
+                mergedInit.signal = timeoutSignal;
+            }
+        }
+
+        return proxyFetch(input, mergedInit, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
+            httpVersion: options.httpVersion,
+            http2Pool: this._http2Pool,
         });
     }
 
     /**
      * Low-level raw tunnel — for non-HTTP use cases (SMTP, custom protocols, etc.).
      *
+     * **Security note:** SOCKS5 proxy credentials are sent over plain TCP.
+     * Only use with trusted/localhost proxies unless you add your own encryption layer.
+     *
      * @param {string} targetHost - Destination hostname or IP.
      * @param {number} targetPort - Destination port.
      * @param {Object} [options] - Connection options.
      * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS 1.3.
      * @param {string} [options.tlsHostname] - SNI hostname (defaults to targetHost).
-     * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream}>}
+     * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+     * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
      */
     async connect(targetHost, targetPort, options = {}) {
         return socks5Connect(this._proxyConfig, targetHost, targetPort, {
             enableTls: options.enableTls || false,
             tlsHostname: options.tlsHostname || targetHost,
+            alpnProtocols: options.alpnProtocols,
         });
     }
 }
