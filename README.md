@@ -10,6 +10,9 @@ Route any HTTP(S) request through a SOCKS5 proxy from the Cloudflare Edge — no
 > [!CAUTION]
 > **Disclaimer:** This software is intended for legitimate use cases such as privacy research, bypassing geo-restrictions on your own content, and building developer tools. **The author(s) are not responsible for how this software is used.** By using this software, you agree that you are solely responsible for ensuring your usage complies with all applicable laws and the terms of service of any third-party services you interact with.
 
+> [!IMPORTANT]
+> **SSRF Warning:** This library is an open proxy — it fetches any URL you pass to `proxy.fetch()`. **Never pass user-controlled URLs directly** without validating/allowlisting the target hostname first. An attacker could use your Worker to reach internal networks, cloud metadata endpoints (`169.254.169.254`), or localhost services.
+
 ## Why not `startTls()`?
 
 Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Edge, making it unusable for proxied HTTPS connections where the SNI hostname differs from the proxy hostname. This library bypasses that limitation entirely by performing the TLS 1.3 handshake in userspace via Rustls WASM.
@@ -37,6 +40,9 @@ fallthrough = true
 ```javascript
 import { Socks5Client } from 'socksflare';
 
+// ⚠️ Always validate target hostnames to prevent SSRF
+const ALLOWED_HOSTS = new Set(['api.example.com', 'cdn.example.com']);
+
 export default {
   async fetch(request, env) {
     const proxy = new Socks5Client({
@@ -46,11 +52,16 @@ export default {
       password: env.SOCKS5_PASS,
     });
 
-    const url = new URL(request.url).searchParams.get('url');
-    if (!url) return new Response('Missing ?url=', { status: 400 });
+    const raw = new URL(request.url).searchParams.get('url');
+    if (!raw) return new Response('Missing ?url=', { status: 400 });
+
+    const target = new URL(raw);
+    if (!ALLOWED_HOSTS.has(target.hostname)) {
+      return new Response('Hostname not allowed', { status: 403 });
+    }
 
     // Drop-in fetch() replacement — routes through SOCKS5 + TLS 1.3
-    return proxy.fetch(url);
+    return proxy.fetch(target, {}, { timeoutMs: 15000 });
   },
 };
 ```
@@ -84,6 +95,7 @@ const response = await proxy.fetch('https://example.com', {
 |-----------|------|-------------|
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
 | `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 with fallback, or require HTTP/2 |
+| `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()`) |
 
 ### `client.connect(targetHost, targetPort, options?)`
 
@@ -118,15 +130,18 @@ import { proxyFetch, socks5Connect } from 'socksflare';
 
 The `rust-tls-wasm/pkg/` directory ships with a pre-built WASM binary. To rebuild from source:
 
-**Prerequisites:** Rust, [wasm-pack](https://rustwasm.github.io/wasm-pack/), LLVM/clang
+**Prerequisites:** [Rust](https://rustup.rs/), [wasm-pack](https://rustwasm.github.io/wasm-pack/installer/), LLVM/clang
 
-```powershell
-# Windows — set CC for ring's C compilation
-$env:CC = "C:\Program Files\LLVM\bin\clang.exe"
-$env:CC_wasm32_unknown_unknown = "C:\Program Files\LLVM\bin\clang.exe"
-
+```bash
 cd rust-tls-wasm
+
+# Linux / macOS
 wasm-pack build --target web
+
+# Windows (PowerShell) — set CC for ring's C compilation
+# $env:CC = "C:\Program Files\LLVM\bin\clang.exe"
+# $env:CC_wasm32_unknown_unknown = $env:CC
+# wasm-pack build --target web
 ```
 
 ## Project Structure
@@ -137,27 +152,18 @@ socksflare/
 │   ├── index.js             ← Main export: Socks5Client class
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
 │   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
-│   ├── proxy-fetch-http2.js ← Experimental HTTP/2 path
+│   ├── proxy-fetch-http2.js ← HTTP/2 path (multiplexed)
 │   └── wasm-tls.js          ← JS bridge to Rustls WASM
 ├── rust-tls-wasm/
 │   ├── src/lib.rs           ← Rustls WasmTlsClient
 │   ├── Cargo.toml           ← rustls 0.23, ring 0.17, wasm-bindgen 0.2
 │   └── pkg/                 ← Pre-built WASM output (committed)
 ├── example/
-│   └── worker.js            ← Minimal demo worker
+│   └── worker.js            ← Demo worker
 ├── package.json
 ├── LICENSE                  ← GPL-3.0-or-later
 └── README.md
 ```
-
-## HTTP/2 Capabilities
-
-`proxy.fetch()` implements enterprise-grade HTTP/2 over SOCKS5 using `options.httpVersion = 'auto'`:
-
-- **Native Multiplexing & Connection Pooling** (parallel requests reuse the TLS tunnel).
-- **AbortSignal Support** (`RST_STREAM` cancellation saves worker CPU limits).
-- **Strict Compliance** (RFC 9113 header sorting, HPACK decoding, window flow control).
-- **DoS Protections** (CVE-2024-27316 mitigation, strict frame limits).
 
 ## Known Limitations
 
@@ -181,7 +187,7 @@ This project was built by someone still learning — contributions, bug fixes, a
 - **[Rustls](https://github.com/rustls/rustls)** — The TLS engine powering the WASM module
 - **[ring](https://github.com/briansmith/ring)** — Cryptographic primitives used by Rustls
 - **[webpki-roots](https://github.com/rustls/webpki-roots)** — Mozilla's root CA certificates
-- **[wasm-bindgen](https://github.com/nicedoc/llvm-builds)** — Rust ↔ JavaScript WASM bridge
+- **[wasm-bindgen](https://github.com/rustwasm/wasm-bindgen)** — Rust ↔ JavaScript WASM bridge
 - Built with ❤️ by [EithonX](https://github.com/EithonX)
 
 ## License

@@ -143,6 +143,9 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
 function buildHttpRequest(url, init) {
     // ── Build HTTP Request ──
     const method = (init.method || 'GET').toUpperCase();
+    if (!/^[A-Z]+$/.test(method)) {
+        throw new Error(`Invalid HTTP method: ${method}`);
+    }
     const path = url.pathname + url.search;
     const host = url.port ? `${url.hostname}:${url.port}` : url.hostname;
     const headers = new Headers(init.headers);

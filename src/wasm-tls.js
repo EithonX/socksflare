@@ -42,6 +42,10 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
         : [];
     const alpnCsv = alpnProtocols.join(',');
 
+    if (!tlsHostname || typeof tlsHostname !== 'string' || tlsHostname.length > 253) {
+        throw new Error('wasmTls: invalid SNI hostname');
+    }
+
     const client = new WasmTlsClient(tlsHostname, alpnCsv || undefined);
 
     // Application-layer readable stream (decrypted data for the caller)
