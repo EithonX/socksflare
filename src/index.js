@@ -42,6 +42,7 @@ export class Socks5Client {
         this.port = parseInt(config.port) || 1080;
         this.username = config.username || config.user || undefined;
         this.password = config.password || config.pass || undefined;
+        this._http2Pool = new Map();
     }
 
     /** @internal */
@@ -68,6 +69,7 @@ export class Socks5Client {
         return proxyFetch(input, init, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
             httpVersion: options.httpVersion,
+            http2Pool: this._http2Pool,
         });
     }
 

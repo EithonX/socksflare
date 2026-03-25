@@ -150,19 +150,20 @@ socksflare/
 └── README.md
 ```
 
+## HTTP/2 Capabilities
+
+`proxy.fetch()` implements enterprise-grade HTTP/2 over SOCKS5 using `options.httpVersion = 'auto'`:
+
+- **Native Multiplexing & Connection Pooling** (parallel requests reuse the TLS tunnel).
+- **AbortSignal Support** (`RST_STREAM` cancellation saves worker CPU limits).
+- **Strict Compliance** (RFC 9113 header sorting, HPACK decoding, window flow control).
+- **DoS Protections** (CVE-2024-27316 mitigation, strict frame limits).
+
 ## Known Limitations
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
 - **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
-
-## HTTP/2 Capabilities
-
-`proxy.fetch()` fully implements secure, high-performance HTTP/2 multiplexing natively (`options.httpVersion = 'auto'` or `'2'`). The client respects:
-
-- Automated HPACK Huffman decoding (RFC 7541).
-- Outbound Window Flow control signaling (RFC 9113).
-- Built-in DoS/Flood security metrics (CVE-2024-27316 mitigation, Control-Frame limits, Maximum Header decoding).
 
 ## Contributing
 

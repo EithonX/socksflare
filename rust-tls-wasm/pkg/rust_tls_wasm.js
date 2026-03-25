@@ -16,11 +16,19 @@ export class WasmTlsClient {
      * @returns {Uint8Array}
      */
     extract_network_data() {
-        const ret = wasm.wasmtlsclient_extract_network_data(this.__wbg_ptr);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.wasmtlsclient_extract_network_data(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
-        return takeFromExternrefTable0(ret[0]);
     }
     /**
      * @returns {boolean}
@@ -33,30 +41,45 @@ export class WasmTlsClient {
      * @returns {string | undefined}
      */
     negotiatedAlpn() {
-        const ret = wasm.wasmtlsclient_negotiatedAlpn(this.__wbg_ptr);
-        let v1;
-        if (ret[0] !== 0) {
-            v1 = getStringFromWasm0(ret[0], ret[1]).slice();
-            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.wasmtlsclient_negotiatedAlpn(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            let v1;
+            if (r0 !== 0) {
+                v1 = getStringFromWasm0(r0, r1).slice();
+                wasm.__wbindgen_export2(r0, r1 * 1, 1);
+            }
+            return v1;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
-        return v1;
     }
     /**
      * @param {string} hostname
      * @param {string | null} [alpn_csv]
      */
     constructor(hostname, alpn_csv) {
-        const ptr0 = passStringToWasm0(hostname, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        var ptr1 = isLikeNone(alpn_csv) ? 0 : passStringToWasm0(alpn_csv, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        var len1 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmtlsclient_new(ptr0, len0, ptr1, len1);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(hostname, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            const len0 = WASM_VECTOR_LEN;
+            var ptr1 = isLikeNone(alpn_csv) ? 0 : passStringToWasm0(alpn_csv, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+            var len1 = WASM_VECTOR_LEN;
+            wasm.wasmtlsclient_new(retptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            this.__wbg_ptr = r0 >>> 0;
+            WasmTlsClientFinalization.register(this, this.__wbg_ptr, this);
+            return this;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
-        this.__wbg_ptr = ret[0] >>> 0;
-        WasmTlsClientFinalization.register(this, this.__wbg_ptr, this);
-        return this;
     }
     /**
      * Feeds raw TCP bytes from the SOCKS5 proxy into the Rustls state machine.
@@ -65,24 +88,40 @@ export class WasmTlsClient {
      * @returns {number}
      */
     provide_network_data(data) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmtlsclient_provide_network_data(this.__wbg_ptr, ptr0, len0);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.wasmtlsclient_provide_network_data(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return r0 >>> 0;
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
-        return ret[0] >>> 0;
     }
     /**
      * Reads decrypted plaintext application data from Rustls.
      * @returns {Uint8Array}
      */
     read_app_data() {
-        const ret = wasm.wasmtlsclient_read_app_data(this.__wbg_ptr);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.wasmtlsclient_read_app_data(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
-        return takeFromExternrefTable0(ret[0]);
     }
     /**
      * @returns {boolean}
@@ -103,11 +142,18 @@ export class WasmTlsClient {
      * @param {Uint8Array} data
      */
     write_app_data(data) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.wasmtlsclient_write_app_data(this.__wbg_ptr, ptr0, len0);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_export3);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.wasmtlsclient_write_app_data(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            if (r1) {
+                throw takeObject(r0);
+            }
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
     }
 }
@@ -117,116 +163,114 @@ function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
         __wbg___wbindgen_is_function_3c846841762788c1: function(arg0) {
-            const ret = typeof(arg0) === 'function';
+            const ret = typeof(getObject(arg0)) === 'function';
             return ret;
         },
         __wbg___wbindgen_is_object_781bc9f159099513: function(arg0) {
-            const val = arg0;
+            const val = getObject(arg0);
             const ret = typeof(val) === 'object' && val !== null;
             return ret;
         },
         __wbg___wbindgen_is_string_7ef6b97b02428fae: function(arg0) {
-            const ret = typeof(arg0) === 'string';
+            const ret = typeof(getObject(arg0)) === 'string';
             return ret;
         },
         __wbg___wbindgen_is_undefined_52709e72fb9f179c: function(arg0) {
-            const ret = arg0 === undefined;
+            const ret = getObject(arg0) === undefined;
             return ret;
         },
         __wbg___wbindgen_throw_6ddd609b62940d55: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
         __wbg_call_2d781c1f4d5c0ef8: function() { return handleError(function (arg0, arg1, arg2) {
-            const ret = arg0.call(arg1, arg2);
-            return ret;
+            const ret = getObject(arg0).call(getObject(arg1), getObject(arg2));
+            return addHeapObject(ret);
         }, arguments); },
         __wbg_crypto_38df2bab126b63dc: function(arg0) {
-            const ret = arg0.crypto;
-            return ret;
+            const ret = getObject(arg0).crypto;
+            return addHeapObject(ret);
         },
         __wbg_getRandomValues_c44a50d8cfdaebeb: function() { return handleError(function (arg0, arg1) {
-            arg0.getRandomValues(arg1);
+            getObject(arg0).getRandomValues(getObject(arg1));
         }, arguments); },
         __wbg_length_ea16607d7b61445b: function(arg0) {
-            const ret = arg0.length;
+            const ret = getObject(arg0).length;
             return ret;
         },
         __wbg_msCrypto_bd5a034af96bcba6: function(arg0) {
-            const ret = arg0.msCrypto;
-            return ret;
+            const ret = getObject(arg0).msCrypto;
+            return addHeapObject(ret);
         },
         __wbg_new_from_slice_22da9388ac046e50: function(arg0, arg1) {
             const ret = new Uint8Array(getArrayU8FromWasm0(arg0, arg1));
-            return ret;
+            return addHeapObject(ret);
         },
         __wbg_new_with_length_825018a1616e9e55: function(arg0) {
             const ret = new Uint8Array(arg0 >>> 0);
-            return ret;
+            return addHeapObject(ret);
         },
         __wbg_node_84ea875411254db1: function(arg0) {
-            const ret = arg0.node;
-            return ret;
+            const ret = getObject(arg0).node;
+            return addHeapObject(ret);
         },
         __wbg_now_16f0c993d5dd6c27: function() {
             const ret = Date.now();
             return ret;
         },
         __wbg_process_44c7a14e11e9f69e: function(arg0) {
-            const ret = arg0.process;
-            return ret;
+            const ret = getObject(arg0).process;
+            return addHeapObject(ret);
         },
         __wbg_prototypesetcall_d62e5099504357e6: function(arg0, arg1, arg2) {
-            Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), arg2);
+            Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), getObject(arg2));
         },
         __wbg_randomFillSync_6c25eac9869eb53c: function() { return handleError(function (arg0, arg1) {
-            arg0.randomFillSync(arg1);
+            getObject(arg0).randomFillSync(takeObject(arg1));
         }, arguments); },
         __wbg_require_b4edbdcf3e2a1ef0: function() { return handleError(function () {
             const ret = module.require;
-            return ret;
+            return addHeapObject(ret);
         }, arguments); },
         __wbg_static_accessor_GLOBAL_8adb955bd33fac2f: function() {
             const ret = typeof global === 'undefined' ? null : global;
-            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+            return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
         __wbg_static_accessor_GLOBAL_THIS_ad356e0db91c7913: function() {
             const ret = typeof globalThis === 'undefined' ? null : globalThis;
-            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+            return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
         __wbg_static_accessor_SELF_f207c857566db248: function() {
             const ret = typeof self === 'undefined' ? null : self;
-            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+            return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
         __wbg_static_accessor_WINDOW_bb9f1ba69d61b386: function() {
             const ret = typeof window === 'undefined' ? null : window;
-            return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
+            return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
         __wbg_subarray_a068d24e39478a8a: function(arg0, arg1, arg2) {
-            const ret = arg0.subarray(arg1 >>> 0, arg2 >>> 0);
-            return ret;
+            const ret = getObject(arg0).subarray(arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
         },
         __wbg_versions_276b2795b1c6a219: function(arg0) {
-            const ret = arg0.versions;
-            return ret;
+            const ret = getObject(arg0).versions;
+            return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Ref(Slice(U8)) -> NamedExternref("Uint8Array")`.
             const ret = getArrayU8FromWasm0(arg0, arg1);
-            return ret;
+            return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
-            return ret;
+            return addHeapObject(ret);
         },
-        __wbindgen_init_externref_table: function() {
-            const table = wasm.__wbindgen_externrefs;
-            const offset = table.grow(4);
-            table.set(0, undefined);
-            table.set(offset + 0, undefined);
-            table.set(offset + 1, null);
-            table.set(offset + 2, true);
-            table.set(offset + 3, false);
+        __wbindgen_object_clone_ref: function(arg0) {
+            const ret = getObject(arg0);
+            return addHeapObject(ret);
+        },
+        __wbindgen_object_drop_ref: function(arg0) {
+            takeObject(arg0);
         },
     };
     return {
@@ -239,15 +283,32 @@ const WasmTlsClientFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_wasmtlsclient_free(ptr >>> 0, 1));
 
-function addToExternrefTable0(obj) {
-    const idx = wasm.__externref_table_alloc();
-    wasm.__wbindgen_externrefs.set(idx, obj);
+function addHeapObject(obj) {
+    if (heap_next === heap.length) heap.push(heap.length + 1);
+    const idx = heap_next;
+    heap_next = heap[idx];
+
+    heap[idx] = obj;
     return idx;
+}
+
+function dropObject(idx) {
+    if (idx < 1028) return;
+    heap[idx] = heap_next;
+    heap_next = idx;
 }
 
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
+}
+
+let cachedDataViewMemory0 = null;
+function getDataViewMemory0() {
+    if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer.detached === true || (cachedDataViewMemory0.buffer.detached === undefined && cachedDataViewMemory0.buffer !== wasm.memory.buffer)) {
+        cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
+    }
+    return cachedDataViewMemory0;
 }
 
 function getStringFromWasm0(ptr, len) {
@@ -263,14 +324,20 @@ function getUint8ArrayMemory0() {
     return cachedUint8ArrayMemory0;
 }
 
+function getObject(idx) { return heap[idx]; }
+
 function handleError(f, args) {
     try {
         return f.apply(this, args);
     } catch (e) {
-        const idx = addToExternrefTable0(e);
-        wasm.__wbindgen_exn_store(idx);
+        wasm.__wbindgen_export(addHeapObject(e));
     }
 }
+
+let heap = new Array(1024).fill(undefined);
+heap.push(undefined, null, true, false);
+
+let heap_next = heap.length;
 
 function isLikeNone(x) {
     return x === undefined || x === null;
@@ -320,10 +387,10 @@ function passStringToWasm0(arg, malloc, realloc) {
     return ptr;
 }
 
-function takeFromExternrefTable0(idx) {
-    const value = wasm.__wbindgen_externrefs.get(idx);
-    wasm.__externref_table_dealloc(idx);
-    return value;
+function takeObject(idx) {
+    const ret = getObject(idx);
+    dropObject(idx);
+    return ret;
 }
 
 let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
@@ -359,8 +426,8 @@ let wasmModule, wasm;
 function __wbg_finalize_init(instance, module) {
     wasm = instance.exports;
     wasmModule = module;
+    cachedDataViewMemory0 = null;
     cachedUint8ArrayMemory0 = null;
-    wasm.__wbindgen_start();
     return wasm;
 }
 

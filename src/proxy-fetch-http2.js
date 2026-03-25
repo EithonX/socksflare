@@ -128,62 +128,302 @@ const HPACK_HUFFMAN_CODE_LENGTHS = [
 
 const HPACK_HUFFMAN_DECODE_TREE = buildHpackHuffmanDecodeTree();
 
+class Http2Connection {
+    constructor(tunnel, pool, poolKey) {
+        this.tunnel = tunnel;
+        this.pool = pool;
+        this.poolKey = poolKey;
+        this.frameReader = new H2FrameReader(tunnel.readable.getReader());
+        this.frameWriter = tunnel.writable.getWriter();
+        this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
+        this.windowTracker = new WindowTracker();
+
+        this.nextStreamId = 1;
+        this.streams = new Map();
+
+        this.closed = false;
+        this.closeError = null;
+
+        this._readLoopPromise = this._startReadLoop().catch(() => { });
+    }
+
+    async init() {
+        await this.frameWriter.write(HTTP2_PREFACE);
+        await writeFrame(this.frameWriter, FRAME_SETTINGS, 0x00, 0, buildSettingsPayload([
+            [SETTINGS_HEADER_TABLE_SIZE, 0],
+            [SETTINGS_ENABLE_PUSH, 0],
+        ]));
+    }
+
+    async fetch(url, requestInit) {
+        if (this.closed) throw this.closeError || new Error('HTTP/2 Connection Closed');
+
+        const streamId = this.nextStreamId;
+        this.nextStreamId += 2;
+        this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
+
+        const method = (requestInit.method || 'GET').toUpperCase();
+        const bodyMode = normalizeRequestBody(requestInit.body);
+
+        const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
+        const hasBody = bodyMode.kind !== 'none';
+        const endStreamFlag = hasBody ? 0 : FLAG_END_STREAM;
+
+        await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
+
+        let abortHandler = null;
+        if (requestInit.signal) {
+            abortHandler = async () => {
+                await writeFrame(this.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8])); // CANCEL
+                const s = this.streams.get(streamId);
+                if (s) {
+                    s.responseDeferred.reject(new DOMException('Aborted', 'AbortError'));
+                    if (s.controller) s.controller.error(new DOMException('Aborted', 'AbortError'));
+                    this.streams.delete(streamId);
+                }
+            };
+            requestInit.signal.addEventListener('abort', abortHandler);
+        }
+
+        return new Promise((resolve, reject) => {
+            const streamState = {
+                responseDeferred: { resolve, reject },
+                controller: null,
+                pushBuffer: [],
+                responseHeaders: new Headers(),
+                status: 200,
+                abortHandler,
+                signal: requestInit.signal,
+                endStreamSeen: false
+            };
+            this.streams.set(streamId, streamState);
+
+            if (hasBody) {
+                (async () => {
+                    try {
+                        if (bodyMode.kind === 'bytes') {
+                            await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
+                        } else if (bodyMode.kind === 'stream') {
+                            await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
+                        }
+                    } catch (err) {
+                        if (this.streams.has(streamId)) {
+                            reject(err);
+                            this._cleanupStream(streamId);
+                        }
+                    }
+                })();
+            }
+        });
+    }
+
+    async _startReadLoop() {
+        let floodCounter = 0;
+        const FLOOD_LIMIT = 100;
+        try {
+            while (!this.closed) {
+                const frame = await this.frameReader.readFrame();
+
+                if (frame.streamId === 0) {
+                    floodCounter++;
+                    if (frame.type === FRAME_SETTINGS) {
+                        if ((frame.flags & FLAG_ACK) === 0) {
+                            for (let i = 0; i < frame.payload.byteLength; i += 6) {
+                                const id = (frame.payload[i] << 8) | frame.payload[i + 1];
+                                const val = (frame.payload[i + 2] << 24) | (frame.payload[i + 3] << 16) | (frame.payload[i + 4] << 8) | frame.payload[i + 5];
+                                if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
+                                else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
+                            }
+                            await writeFrame(this.frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
+                        }
+                    } else if (frame.type === FRAME_PING) {
+                        if ((frame.flags & FLAG_ACK) === 0) {
+                            await writeFrame(this.frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
+                        }
+                    } else if (frame.type === FRAME_GOAWAY) {
+                        const errorCode = frame.payload.byteLength >= 8 ? ((frame.payload[4] << 24) | (frame.payload[5] << 16) | (frame.payload[6] << 8) | frame.payload[7]) : 0;
+                        throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
+                    } else if (frame.type === FRAME_WINDOW_UPDATE) {
+                        if (frame.payload.byteLength === 4) {
+                            const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                            this.windowTracker.addCredits(0, increment);
+                        }
+                    }
+                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
+                    continue;
+                }
+
+                const stream = this.streams.get(frame.streamId);
+                if (!stream) {
+                    floodCounter++;
+                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
+                    continue;
+                }
+
+                if (frame.type === FRAME_WINDOW_UPDATE) {
+                    if (frame.payload.byteLength === 4) {
+                        const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                        this.windowTracker.addCredits(frame.streamId, increment);
+                    }
+                    floodCounter++;
+                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
+                    continue;
+                }
+
+                if (frame.type === FRAME_HEADERS) {
+                    floodCounter = 0;
+
+                    const fragments = [parseHeadersPayload(frame.payload, frame.flags).fragment];
+                    let totalLength = fragments[0].byteLength;
+                    let isEndHeaders = (frame.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS;
+                    let isEndStream = (frame.flags & FLAG_END_STREAM) === FLAG_END_STREAM;
+
+                    while (!isEndHeaders) {
+                        const cframe = await this.frameReader.readFrame();
+                        if (cframe.streamId !== frame.streamId || cframe.type !== FRAME_CONTINUATION) {
+                            throw new Error('HTTP/2: invalid continuation sequence');
+                        }
+                        fragments.push(cframe.payload);
+                        totalLength += cframe.payload.byteLength;
+                        if (totalLength > MAX_HEADER_LIST_SIZE) throw new Error('CVE-2024-27316 block');
+                        isEndHeaders = (cframe.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS;
+                    }
+
+                    const decoded = this.hpackDecoder.decode(concatChunks(fragments));
+
+                    if (!stream.controller) {
+                        stream.status = getStatusFromDecoded(decoded) || 200;
+                        applyRegularHeaders(decoded, stream.responseHeaders);
+
+                        const self = this;
+                        const streamId = frame.streamId;
+                        const bodyStream = new ReadableStream({
+                            start(controller) {
+                                stream.controller = controller;
+                                for (const chunk of stream.pushBuffer) controller.enqueue(chunk);
+                                stream.pushBuffer = [];
+                                if (isEndStream || stream.endStreamSeen) {
+                                    controller.close();
+                                    self._cleanupStream(streamId);
+                                }
+                            },
+                            async cancel() {
+                                await writeFrame(self.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8]));
+                                self._cleanupStream(streamId);
+                            }
+                        });
+
+                        stream.responseDeferred.resolve(new Response(bodyStream, {
+                            status: stream.status,
+                            headers: stream.responseHeaders
+                        }));
+                    } else {
+                        applyTrailerHeaders(decoded, stream.responseHeaders);
+                    }
+
+                    if (isEndStream) {
+                        stream.endStreamSeen = true;
+                        if (stream.controller) {
+                            stream.controller.close();
+                            this._cleanupStream(frame.streamId);
+                        }
+                    }
+                    continue;
+                }
+
+                if (frame.type === FRAME_DATA) {
+                    const parsed = parseDataPayload(frame.payload, frame.flags);
+                    if (parsed.data.byteLength > 0) {
+                        floodCounter = 0;
+                        await sendWindowUpdate(this.frameWriter, 0, parsed.data.byteLength);
+                        await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.data.byteLength);
+
+                        if (stream.controller) {
+                            stream.controller.enqueue(parsed.data);
+                        } else {
+                            stream.pushBuffer.push(parsed.data);
+                        }
+                    } else {
+                        floodCounter++;
+                        if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Empty DATA frame flood detected');
+                    }
+
+                    if (parsed.endStream) {
+                        stream.endStreamSeen = true;
+                        if (stream.controller) {
+                            stream.controller.close();
+                            this._cleanupStream(frame.streamId);
+                        }
+                    }
+                    continue;
+                }
+
+                if (frame.type === FRAME_RST_STREAM) {
+                    if (stream.responseDeferred.reject) stream.responseDeferred.reject(new Error('HTTP/2: stream reset by peer'));
+                    if (stream.controller) stream.controller.error(new Error('HTTP/2: stream reset by peer'));
+                    this._cleanupStream(frame.streamId);
+                    continue;
+                }
+            }
+        } catch (err) {
+            this.close(err);
+        }
+    }
+
+    _cleanupStream(streamId) {
+        const s = this.streams.get(streamId);
+        if (s) {
+            if (s.abortHandler && s.signal) s.signal.removeEventListener('abort', s.abortHandler);
+            this.streams.delete(streamId);
+        }
+    }
+
+    close(err) {
+        if (this.closed) return;
+        this.closed = true;
+        this.closeError = err;
+        if (this.pool && this.poolKey) this.pool.delete(this.poolKey);
+
+        for (const [id, stream] of this.streams.entries()) {
+            if (stream.abortHandler && stream.signal) stream.signal.removeEventListener('abort', stream.abortHandler);
+            const rejectErr = err || new Error('HTTP/2 Connection Closed');
+            if (stream.responseDeferred && stream.responseDeferred.reject) stream.responseDeferred.reject(rejectErr);
+            if (stream.controller) stream.controller.error(rejectErr);
+        }
+        this.streams.clear();
+        try { this.tunnel.socket.close(); } catch (_) { }
+    }
+}
+
 export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, options = {}) {
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port, 10) || 443;
     const tlsHostname = options.tlsHostname || targetHost;
-    const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
-        enableTls: true,
-        tlsHostname,
-        alpnProtocols: ['h2', 'http/1.1'],
-    });
 
-    const negotiated = tunnel.alpnProtocol || null;
-    if (negotiated !== 'h2') {
-        try { await tunnel.socket.close(); } catch (_) { /* noop */ }
-        throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
-    }
+    const pool = options.http2Pool;
+    const poolKey = `${tlsHostname}:${targetPort}`;
 
-    const frameReader = new H2FrameReader(tunnel.readable.getReader());
-    const frameWriter = tunnel.writable.getWriter();
-    const hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
+    let conn = pool ? pool.get(poolKey) : null;
 
-    try {
-        await frameWriter.write(HTTP2_PREFACE);
-        await writeFrame(frameWriter, FRAME_SETTINGS, 0x00, 0, buildSettingsPayload([
-            [SETTINGS_HEADER_TABLE_SIZE, 0],
-            [SETTINGS_ENABLE_PUSH, 0],
-        ]));
-
-        const method = (requestInit.method || 'GET').toUpperCase();
-        const bodyMode = normalizeRequestBody(requestInit.body);
-        const headersList = buildRequestHeaders(url, requestInit, method, bodyMode);
-        const headerBlock = encodeRequestHeaderBlock(headersList);
-
-        const streamId = 1;
-        const headersEndStream = bodyMode.kind === 'none';
-        await writeHeaderBlock(frameWriter, streamId, headerBlock, headersEndStream);
-
-        const windowTracker = new WindowTracker();
-
-        const writePromise = (async () => {
-            if (bodyMode.kind === 'bytes') {
-                await writeDataBytes(frameWriter, windowTracker, streamId, bodyMode.bytes, true);
-            } else if (bodyMode.kind === 'stream') {
-                await writeDataStream(frameWriter, windowTracker, streamId, bodyMode.stream);
-            }
-        })().catch(err => {
-            console.error('HTTP/2 write error:', err);
-            try { tunnel.socket.close(); } catch (_) { /* noop */ }
+    if (!conn || conn.closed) {
+        const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
+            enableTls: true,
+            tlsHostname,
+            alpnProtocols: ['h2', 'http/1.1'],
         });
 
-        return await readResponse(frameReader, frameWriter, streamId, hpackDecoder, tunnel.socket, windowTracker);
-    } catch (err) {
-        try { frameReader.releaseLock(); } catch (_) { /* noop */ }
-        try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
-        try { await tunnel.socket.close(); } catch (_) { /* noop */ }
-        throw err;
+        const negotiated = tunnel.alpnProtocol || null;
+        if (negotiated !== 'h2') {
+            try { await tunnel.socket.close(); } catch (_) { /* noop */ }
+            throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
+        }
+
+        conn = new Http2Connection(tunnel, pool, poolKey);
+        await conn.init();
+        if (pool) pool.set(poolKey, conn);
     }
+
+    return conn.fetch(url, requestInit);
 }
 
 class H2FrameReader {

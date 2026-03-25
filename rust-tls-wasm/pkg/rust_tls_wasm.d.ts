@@ -33,24 +33,21 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_wasmtlsclient_free: (a: number, b: number) => void;
-    readonly wasmtlsclient_extract_network_data: (a: number) => [number, number, number];
+    readonly wasmtlsclient_extract_network_data: (a: number, b: number) => void;
     readonly wasmtlsclient_is_handshaking: (a: number) => number;
-    readonly wasmtlsclient_negotiatedAlpn: (a: number) => [number, number];
-    readonly wasmtlsclient_new: (a: number, b: number, c: number, d: number) => [number, number, number];
-    readonly wasmtlsclient_provide_network_data: (a: number, b: number, c: number) => [number, number, number];
-    readonly wasmtlsclient_read_app_data: (a: number) => [number, number, number];
+    readonly wasmtlsclient_negotiatedAlpn: (a: number, b: number) => void;
+    readonly wasmtlsclient_new: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly wasmtlsclient_provide_network_data: (a: number, b: number, c: number, d: number) => void;
+    readonly wasmtlsclient_read_app_data: (a: number, b: number) => void;
     readonly wasmtlsclient_wants_read: (a: number) => number;
     readonly wasmtlsclient_wants_write: (a: number) => number;
-    readonly wasmtlsclient_write_app_data: (a: number, b: number, c: number) => [number, number];
+    readonly wasmtlsclient_write_app_data: (a: number, b: number, c: number, d: number) => void;
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly __wbindgen_exn_store: (a: number) => void;
-    readonly __externref_table_alloc: () => number;
-    readonly __wbindgen_externrefs: WebAssembly.Table;
-    readonly __externref_table_dealloc: (a: number) => void;
-    readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_malloc: (a: number, b: number) => number;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_start: () => void;
+    readonly __wbindgen_export: (a: number) => void;
+    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export3: (a: number, b: number) => number;
+    readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
