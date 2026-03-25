@@ -1,8 +1,7 @@
 /**
- * Experimental HTTP/2 fetch over SOCKS5 + Rustls WASM TLS.
+ * HTTP/2 fetch over SOCKS5 + Rustls WASM TLS.
  *
- * This module provides a single-stream HTTP/2 client path intended for
- * controlled rollout while keeping the existing HTTP/1.1 path intact.
+ * Multiplexed connection pool with RFC 9113 compliance hardening.
  *
  * @module proxy-fetch-http2
  * @license GPL-3.0-or-later
@@ -35,7 +34,13 @@ const SETTINGS_ENABLE_PUSH = 0x2;
 
 const DEFAULT_MAX_FRAME_SIZE = 16384;
 const DEFAULT_HEADER_TABLE_SIZE = 4096;
-const MAX_WINDOW_INCREMENT = 0x7fffffff;
+const MAX_WINDOW_SIZE = 0x7fffffff;            // RFC 9113 §6.9.1: 2^31-1
+const MAX_STREAM_ID = 0x7ffffffe;              // RFC 9113: max client stream ID (odd, < 2^31)
+const MAX_HEADER_LIST_SIZE = 65536;
+
+// We send SETTINGS_HEADER_TABLE_SIZE = 0, so any dynamic table size update
+// from the peer above this value is a protocol error.
+const ADVERTISED_HEADER_TABLE_SIZE = 0;
 
 // RFC 7541 static table (1-based index).
 const HPACK_STATIC_TABLE = [
@@ -135,7 +140,7 @@ class Http2Connection {
         this.poolKey = poolKey;
         this.frameReader = new H2FrameReader(tunnel.readable.getReader());
         this.frameWriter = tunnel.writable.getWriter();
-        this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
+        this.hpackDecoder = new HpackDecoder(ADVERTISED_HEADER_TABLE_SIZE);
         this.windowTracker = new WindowTracker();
 
         this.nextStreamId = 1;
@@ -150,13 +155,19 @@ class Http2Connection {
     async init() {
         await this.frameWriter.write(HTTP2_PREFACE);
         await writeFrame(this.frameWriter, FRAME_SETTINGS, 0x00, 0, buildSettingsPayload([
-            [SETTINGS_HEADER_TABLE_SIZE, 0],
+            [SETTINGS_HEADER_TABLE_SIZE, ADVERTISED_HEADER_TABLE_SIZE],
             [SETTINGS_ENABLE_PUSH, 0],
         ]));
     }
 
     async fetch(url, requestInit) {
         if (this.closed) throw this.closeError || new Error('HTTP/2 Connection Closed');
+
+        // M2: Stream ID exhaustion check
+        if (this.nextStreamId > MAX_STREAM_ID) {
+            this.close(new Error('HTTP/2: stream ID space exhausted'));
+            throw new Error('HTTP/2: stream ID space exhausted, open a new connection');
+        }
 
         const streamId = this.nextStreamId;
         this.nextStreamId += 2;
@@ -167,7 +178,6 @@ class Http2Connection {
 
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
-        const endStreamFlag = hasBody ? 0 : FLAG_END_STREAM;
 
         await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
 
@@ -222,7 +232,7 @@ class Http2Connection {
         const FLOOD_LIMIT = 100;
         try {
             while (!this.closed) {
-                const frame = await this.frameReader.readFrame();
+                const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
 
                 if (frame.streamId === 0) {
                     floodCounter++;
@@ -246,6 +256,8 @@ class Http2Connection {
                     } else if (frame.type === FRAME_WINDOW_UPDATE) {
                         if (frame.payload.byteLength === 4) {
                             const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                            // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
+                            if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
                             this.windowTracker.addCredits(0, increment);
                         }
                     }
@@ -263,6 +275,8 @@ class Http2Connection {
                 if (frame.type === FRAME_WINDOW_UPDATE) {
                     if (frame.payload.byteLength === 4) {
                         const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                        // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
+                        if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
                         this.windowTracker.addCredits(frame.streamId, increment);
                     }
                     floodCounter++;
@@ -279,7 +293,7 @@ class Http2Connection {
                     let isEndStream = (frame.flags & FLAG_END_STREAM) === FLAG_END_STREAM;
 
                     while (!isEndHeaders) {
-                        const cframe = await this.frameReader.readFrame();
+                        const cframe = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
                         if (cframe.streamId !== frame.streamId || cframe.type !== FRAME_CONTINUATION) {
                             throw new Error('HTTP/2: invalid continuation sequence');
                         }
@@ -401,7 +415,8 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const tlsHostname = options.tlsHostname || targetHost;
 
     const pool = options.http2Pool;
-    const poolKey = `${tlsHostname}:${targetPort}`;
+    // H2: Pool key includes actual target host to prevent cross-origin reuse
+    const poolKey = `${targetHost}:${targetPort}:${tlsHostname}`;
 
     let conn = pool ? pool.get(poolKey) : null;
 
@@ -478,12 +493,25 @@ class H2FrameReader {
         return result;
     }
 
-    async readFrame() {
+    // H1: Enforce frame payload size against negotiated MAX_FRAME_SIZE
+    async readFrame(peerMaxFrameSize) {
         const head = await this.readExact(9);
         const length = (head[0] << 16) | (head[1] << 8) | head[2];
         const type = head[3];
         const flags = head[4];
         const streamId = ((head[5] & 0x7f) << 24) | (head[6] << 16) | (head[7] << 8) | head[8];
+
+        // RFC 9113 §4.2: Frame size MUST NOT exceed 2^24-1 (protocol max)
+        if (length > 16777215) {
+            throw new Error('HTTP/2: frame length exceeds protocol maximum (2^24-1)');
+        }
+        // Enforce negotiated MAX_FRAME_SIZE for non-exempt frame types.
+        // SETTINGS, PING, GOAWAY are allowed at connection default (16384) even before negotiation.
+        const effectiveMax = peerMaxFrameSize || DEFAULT_MAX_FRAME_SIZE;
+        if (length > effectiveMax && type !== FRAME_SETTINGS && type !== FRAME_GOAWAY) {
+            throw new Error(`HTTP/2: frame payload (${length}) exceeds MAX_FRAME_SIZE (${effectiveMax})`);
+        }
+
         const payload = length > 0 ? await this.readExact(length) : new Uint8Array(0);
         return { length, type, flags, streamId, payload };
     }
@@ -517,12 +545,20 @@ class WindowTracker {
         this._notify();
     }
 
+    // H3: RFC 9113 §6.9.1 — window MUST NOT exceed 2^31-1
     addCredits(streamId, increment) {
         if (streamId === 0) {
             this.connectionWindow += increment;
+            if (this.connectionWindow > MAX_WINDOW_SIZE) {
+                throw new Error('HTTP/2: connection flow-control window overflow (FLOW_CONTROL_ERROR)');
+            }
         } else {
             const current = this.streamWindows.get(streamId) || this.initialWindowSize;
-            this.streamWindows.set(streamId, current + increment);
+            const newVal = current + increment;
+            if (newVal > MAX_WINDOW_SIZE) {
+                throw new Error('HTTP/2: stream flow-control window overflow (FLOW_CONTROL_ERROR)');
+            }
+            this.streamWindows.set(streamId, newVal);
         }
         this._notify();
     }
@@ -668,185 +704,17 @@ class HpackDecoder {
         this.dynamicTableSize += size;
     }
 
+    // M1: Reject dynamic table size updates exceeding our SETTINGS_HEADER_TABLE_SIZE
     updateDynamicSize(newSize) {
+        if (newSize > ADVERTISED_HEADER_TABLE_SIZE) {
+            throw new Error(`HTTP/2 HPACK: dynamic table size update (${newSize}) exceeds SETTINGS limit (${ADVERTISED_HEADER_TABLE_SIZE})`);
+        }
         this.maxDynamicSize = newSize;
         while (this.dynamicTableSize > this.maxDynamicSize && this.dynamicTable.length > 0) {
             const evicted = this.dynamicTable.pop();
             this.dynamicTableSize -= evicted ? evicted.size : 0;
         }
     }
-}
-
-async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, socket, windowTracker) {
-    const headers = new Headers();
-    let status = 200;
-    let statusSeen = false;
-    let streamEnded = false;
-    let responseHeadersComplete = false;
-    const initialBodyChunks = [];
-    let floodCounter = 0;
-    const FLOOD_LIMIT = 100;
-
-    while (!streamEnded) {
-        const frame = await frameReader.readFrame();
-
-        if (frame.streamId === 0) {
-            await handleConnectionFrame(frameWriter, frame, windowTracker);
-            floodCounter++;
-            if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-            continue;
-        }
-
-        if (frame.streamId !== streamId) {
-            floodCounter++;
-            if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-            continue;
-        }
-
-        if (frame.type === FRAME_WINDOW_UPDATE) {
-            if (frame.payload.byteLength === 4) {
-                const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
-                windowTracker.addCredits(streamId, increment);
-            }
-            floodCounter++;
-            if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-            continue;
-        }
-
-        if (frame.type === FRAME_HEADERS) {
-            floodCounter = 0;
-            const block = await collectHeaderBlock(frameReader, frameWriter, streamId, frame, windowTracker);
-            const decoded = hpackDecoder.decode(block.headerBlock);
-
-            if (!responseHeadersComplete) {
-                const parsedStatus = getStatusFromDecoded(decoded);
-                if (parsedStatus >= 100 && parsedStatus < 200 && parsedStatus !== 101) {
-                    // Informational response block (e.g. 100 Continue), keep waiting for final headers.
-                    continue;
-                }
-
-                if (parsedStatus > 0) {
-                    status = parsedStatus;
-                    statusSeen = true;
-                }
-                applyRegularHeaders(decoded, headers);
-                responseHeadersComplete = true;
-            } else {
-                // Trailers: append only regular headers.
-                applyTrailerHeaders(decoded, headers);
-            }
-
-            if (block.endStream) {
-                streamEnded = true;
-            }
-            continue;
-        }
-
-        if (frame.type === FRAME_DATA) {
-            if (!responseHeadersComplete) {
-                throw new Error('HTTP/2: DATA received before response HEADERS');
-            }
-            const parsed = parseDataPayload(frame.payload, frame.flags);
-            if (parsed.data.byteLength > 0) {
-                initialBodyChunks.push(parsed.data);
-
-                await sendWindowUpdate(frameWriter, 0, parsed.data.byteLength);
-                await sendWindowUpdate(frameWriter, streamId, parsed.data.byteLength);
-            }
-
-            if (parsed.endStream) {
-                streamEnded = true;
-            }
-            continue;
-        }
-
-        if (frame.type === FRAME_RST_STREAM) {
-            throw new Error('HTTP/2: stream reset by peer');
-        }
-
-        if (frame.type === FRAME_GOAWAY) {
-            throw new Error('HTTP/2: peer sent GOAWAY');
-        }
-    }
-
-    if (!statusSeen) {
-        throw new Error('HTTP/2: response missing :status pseudo-header');
-    }
-
-    if (streamEnded && initialBodyChunks.length === 0) {
-        try { frameReader.releaseLock(); } catch (_) { /* noop */ }
-        try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
-        try { await socket.close(); } catch (_) { /* noop */ }
-        return new Response(null, { status, headers });
-    }
-
-    const bodyStream = createHttp2BodyStream({
-        frameReader,
-        frameWriter,
-        streamId,
-        hpackDecoder,
-        headers,
-        initialBodyChunks,
-        streamEnded,
-        socket,
-        windowTracker,
-    });
-    return new Response(bodyStream, { status, headers });
-}
-
-async function handleConnectionFrame(frameWriter, frame, windowTracker) {
-    if (frame.type === FRAME_SETTINGS) {
-        if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
-            return;
-        }
-        if ((frame.payload.byteLength % 6) !== 0) {
-            throw new Error('HTTP/2: invalid SETTINGS payload length');
-        }
-
-        for (let i = 0; i < frame.payload.byteLength; i += 6) {
-            const id = (frame.payload[i] << 8) | frame.payload[i + 1];
-            const val = (frame.payload[i + 2] << 24) | (frame.payload[i + 3] << 16) | (frame.payload[i + 4] << 8) | frame.payload[i + 5];
-            if (id === 0x4) {
-                windowTracker.updateInitialWindowSize(val);
-            } else if (id === 0x5) {
-                windowTracker.updateMaxFrameSize(val);
-            }
-        }
-
-        await writeFrame(frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
-        return;
-    }
-
-    if (frame.type === FRAME_WINDOW_UPDATE) {
-        if (frame.payload.byteLength === 4) {
-            const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
-            windowTracker.addCredits(0, increment);
-        }
-        return;
-    }
-
-    if (frame.type === FRAME_GOAWAY) {
-        if (frame.payload.byteLength >= 8) {
-            const errorCode = (frame.payload[4] << 24) | (frame.payload[5] << 16) | (frame.payload[6] << 8) | frame.payload[7];
-            if (errorCode !== 0) {
-                throw new Error(`HTTP/2: GOAWAY received with error code ${errorCode}`);
-            }
-        }
-        return;
-    }
-
-    if (frame.type === FRAME_PING) {
-        if (frame.payload.byteLength !== 8) {
-            return;
-        }
-        if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
-            return;
-        }
-        await writeFrame(frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
-        return;
-    }
-
-    // Ignore WINDOW_UPDATE and other connection-level frames we do not need for now.
 }
 
 function getStatusFromDecoded(decoded) {
@@ -871,178 +739,6 @@ function applyTrailerHeaders(decoded, headers) {
         if (!name || name[0] === ':' || value == null) continue;
         headers.append(name, value);
     }
-}
-
-const MAX_HEADER_LIST_SIZE = 65536;
-
-async function collectHeaderBlock(frameReader, frameWriter, streamId, firstHeadersFrame, windowTracker) {
-    const parsed = parseHeadersPayload(firstHeadersFrame.payload, firstHeadersFrame.flags);
-    const fragments = [parsed.fragment];
-    let totalLength = parsed.fragment.byteLength;
-
-    if (parsed.endHeaders) {
-        return { headerBlock: concatChunks(fragments), endStream: parsed.endStream };
-    }
-
-    while (true) {
-        const frame = await frameReader.readFrame();
-
-        if (frame.streamId === 0) {
-            await handleConnectionFrame(frameWriter, frame, windowTracker);
-            continue;
-        }
-
-        if (frame.streamId !== streamId || frame.type !== FRAME_CONTINUATION) {
-            throw new Error('HTTP/2: invalid continuation sequence');
-        }
-
-        fragments.push(frame.payload);
-        totalLength += frame.payload.byteLength;
-        if (totalLength > MAX_HEADER_LIST_SIZE) {
-            throw new Error('HTTP/2: Max header list size exceeded (CVE-2024-27316 prevention)');
-        }
-
-        if ((frame.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS) {
-            return { headerBlock: concatChunks(fragments), endStream: parsed.endStream };
-        }
-    }
-}
-
-function createHttp2BodyStream({
-    frameReader,
-    frameWriter,
-    streamId,
-    hpackDecoder,
-    headers,
-    initialBodyChunks,
-    streamEnded,
-    socket,
-    windowTracker,
-}) {
-    const queue = [...initialBodyChunks];
-    let done = streamEnded;
-    let reading = false;
-    let cleanedUp = false;
-    let floodCounter = 0;
-    const FLOOD_LIMIT = 100;
-
-    async function cleanup() {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        try { frameReader.releaseLock(); } catch (_) { /* noop */ }
-        try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
-        try { await socket.close(); } catch (_) { /* noop */ }
-    }
-
-    async function readUntilChunkOrDone(controller) {
-        while (!done) {
-            const frame = await frameReader.readFrame();
-
-            if (frame.streamId === 0) {
-                await handleConnectionFrame(frameWriter, frame, windowTracker);
-                floodCounter++;
-                if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                continue;
-            }
-
-            if (frame.streamId !== streamId) {
-                floodCounter++;
-                if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                continue;
-            }
-
-            if (frame.type === FRAME_WINDOW_UPDATE) {
-                if (frame.payload.byteLength === 4) {
-                    const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
-                    windowTracker.addCredits(streamId, increment);
-                }
-                floodCounter++;
-                if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                continue;
-            }
-
-            if (frame.type === FRAME_DATA) {
-                const parsed = parseDataPayload(frame.payload, frame.flags);
-                if (parsed.data.byteLength > 0) {
-                    floodCounter = 0;
-                    await sendWindowUpdate(frameWriter, 0, parsed.data.byteLength);
-                    await sendWindowUpdate(frameWriter, streamId, parsed.data.byteLength);
-                    controller.enqueue(parsed.data);
-                } else {
-                    floodCounter++;
-                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Empty DATA frame flood detected');
-                }
-
-                if (parsed.endStream) {
-                    done = true;
-                }
-
-                if (parsed.data.byteLength > 0 || done) {
-                    return;
-                }
-                continue;
-            }
-
-            if (frame.type === FRAME_HEADERS) {
-                floodCounter = 0;
-                // Trailer headers.
-                const block = await collectHeaderBlock(frameReader, frameWriter, streamId, frame, windowTracker);
-                const decoded = hpackDecoder.decode(block.headerBlock);
-                applyTrailerHeaders(decoded, headers);
-                if (block.endStream) {
-                    done = true;
-                }
-                continue;
-            }
-
-            if (frame.type === FRAME_RST_STREAM) {
-                throw new Error('HTTP/2: stream reset by peer');
-            }
-
-            if (frame.type === FRAME_GOAWAY) {
-                throw new Error('HTTP/2: peer sent GOAWAY');
-            }
-        }
-    }
-
-    return new ReadableStream({
-        async pull(controller) {
-            if (queue.length > 0) {
-                controller.enqueue(queue.shift());
-                if (queue.length === 0 && done) {
-                    controller.close();
-                    await cleanup();
-                }
-                return;
-            }
-
-            if (done) {
-                controller.close();
-                await cleanup();
-                return;
-            }
-
-            if (reading) return;
-            reading = true;
-            try {
-                await readUntilChunkOrDone(controller);
-                if (done) {
-                    controller.close();
-                    await cleanup();
-                }
-            } catch (err) {
-                done = true;
-                controller.error(err);
-                await cleanup();
-            } finally {
-                reading = false;
-            }
-        },
-        async cancel() {
-            done = true;
-            await cleanup();
-        },
-    });
 }
 
 function parseHeadersPayload(payload, flags) {
@@ -1429,7 +1125,7 @@ function buildSettingsPayload(pairs) {
 
 async function sendWindowUpdate(writer, streamId, increment) {
     if (!Number.isInteger(increment) || increment <= 0) return;
-    const inc = Math.min(increment, MAX_WINDOW_INCREMENT);
+    const inc = Math.min(increment, MAX_WINDOW_SIZE);
     const payload = new Uint8Array(4);
     payload[0] = (inc >> 24) & 0x7f; // top bit reserved
     payload[1] = (inc >> 16) & 0xff;
@@ -1470,14 +1166,5 @@ function concatChunks(chunks) {
         out.set(c, offset);
         offset += c.byteLength;
     }
-    return out;
-}
-
-function appendBuffer(a, b) {
-    if (a.byteLength === 0) return b;
-    if (b.byteLength === 0) return a;
-    const out = new Uint8Array(a.byteLength + b.byteLength);
-    out.set(a, 0);
-    out.set(b, a.byteLength);
     return out;
 }

@@ -19,6 +19,12 @@ import { proxyFetchHttp2 } from './proxy-fetch-http2.js';
 const CR = 0x0D;
 const LF = 0x0A;
 
+// Security limits — tuned for Cloudflare Workers (128MB memory ceiling)
+const MAX_HEADER_SIZE = 128 * 1024;          // 128KB max response headers
+const MAX_RESPONSE_HEADERS = 200;            // max individual header lines
+const MAX_HEADER_LINE_LENGTH = 8192;         // 8KB per header line
+const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
+
 // ─── Main Export ────────────────────────────────────────────────────
 
 /**
@@ -196,7 +202,7 @@ async function parseResponseBinary(readable, socket) {
     const reader = readable.getReader();
     const decoder = new TextDecoder();
 
-    // Accumulate bytes until we find \r\n\r\n
+    // Accumulate bytes until we find \r\n\r\n (bounded to prevent memory DoS)
     let buffers = [];
     let totalLen = 0;
     let headerEndOffset = -1;
@@ -216,6 +222,10 @@ async function parseResponseBinary(readable, socket) {
         buffers.push(value);
         totalLen += value.byteLength;
 
+        if (totalLen > MAX_HEADER_SIZE) {
+            throw new Error(`HTTP response headers too large (>${MAX_HEADER_SIZE} bytes)`);
+        }
+
         combined = concatBuffers(buffers, totalLen);
         headerEndOffset = findHeaderEnd(combined);
     }
@@ -233,13 +243,23 @@ async function parseResponseBinary(readable, socket) {
     const statusText = statusMatch[2] || '';
 
     const responseHeaders = new Headers();
+    let headerCount = 0;
     for (let i = 1; i < lines.length; i++) {
+        if (++headerCount > MAX_RESPONSE_HEADERS) {
+            throw new Error(`Too many response headers (>${MAX_RESPONSE_HEADERS})`);
+        }
+        if (lines[i].length > MAX_HEADER_LINE_LENGTH) {
+            throw new Error(`Response header line too long (>${MAX_HEADER_LINE_LENGTH})`);
+        }
         const idx = lines[i].indexOf(':');
         if (idx > 0) {
-            responseHeaders.append(
-                lines[i].substring(0, idx).trim(),
-                lines[i].substring(idx + 1).trim()
-            );
+            const name = lines[i].substring(0, idx).trim();
+            const value = lines[i].substring(idx + 1).trim();
+            // RFC 7230 §3.2.6: reject header names with non-token characters
+            if (!/^[\x21-\x7E]+$/.test(name)) continue;
+            // Strip control characters from values (null bytes, etc.)
+            const safeValue = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+            responseHeaders.append(name, safeValue);
         }
     }
 
@@ -353,7 +373,7 @@ function createChunkedStream(reader, initialData, socket) {
                 const sizeStr = new TextDecoder().decode(buffer.subarray(0, lineEnd)).trim();
                 const chunkSize = parseInt(sizeStr.split(';')[0], 16);
 
-                if (isNaN(chunkSize) || chunkSize < 0) {
+                if (isNaN(chunkSize) || chunkSize < 0 || chunkSize > MAX_CHUNK_SIZE) {
                     streamDone = true; controller.close(); return;
                 }
 
