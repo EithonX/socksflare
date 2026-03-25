@@ -154,9 +154,15 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
-- **HTTP/2 Is Experimental:** `proxy.fetch()` supports an experimental HTTP/2 mode (`options.httpVersion = 'auto'` or `'2'`) designed for single-stream usage and graceful fallback.
-- **HTTP/2 Compatibility Is In Progress:** Some servers may still fail the experimental HTTP/2 path (for example due advanced HPACK/header encoding behavior). Use `httpVersion: 'auto'` for fallback-friendly rollout.
-- **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library.
+- **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
+
+## HTTP/2 Capabilities
+
+`proxy.fetch()` fully implements secure, high-performance HTTP/2 multiplexing natively (`options.httpVersion = 'auto'` or `'2'`). The client respects:
+
+- Automated HPACK Huffman decoding (RFC 7541).
+- Outbound Window Flow control signaling (RFC 9113).
+- Built-in DoS/Flood security metrics (CVE-2024-27316 mitigation, Control-Frame limits, Maximum Header decoding).
 
 ## Contributing
 
@@ -165,7 +171,7 @@ This project was built by someone still learning — contributions, bug fixes, a
 **Areas where help is especially needed:**
 
 - Mimicking real browser TLS fingerprints (JA3/JA4 spoofing in Rustls)
-- HTTP/2 support over SOCKS5
+- HTTP/3 support over SOCKS5
 - Better error handling and retry logic
 - Performance benchmarks and optimization
 

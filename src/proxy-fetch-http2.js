@@ -585,6 +585,16 @@ async function handleConnectionFrame(frameWriter, frame, windowTracker) {
         return;
     }
 
+    if (frame.type === FRAME_GOAWAY) {
+        if (frame.payload.byteLength >= 8) {
+            const errorCode = (frame.payload[4] << 24) | (frame.payload[5] << 16) | (frame.payload[6] << 8) | frame.payload[7];
+            if (errorCode !== 0) {
+                throw new Error(`HTTP/2: GOAWAY received with error code ${errorCode}`);
+            }
+        }
+        return;
+    }
+
     if (frame.type === FRAME_PING) {
         if (frame.payload.byteLength !== 8) {
             return;
