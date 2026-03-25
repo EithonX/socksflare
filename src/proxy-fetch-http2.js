@@ -164,13 +164,21 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
         const headersEndStream = bodyMode.kind === 'none';
         await writeHeaderBlock(frameWriter, streamId, headerBlock, headersEndStream);
 
-        if (bodyMode.kind === 'bytes') {
-            await writeDataBytes(frameWriter, streamId, bodyMode.bytes, true);
-        } else if (bodyMode.kind === 'stream') {
-            await writeDataStream(frameWriter, streamId, bodyMode.stream);
-        }
+        const windowTracker = new WindowTracker();
 
-        return await readResponse(frameReader, frameWriter, streamId, hpackDecoder, tunnel.socket);
+        // Start write operation concurrently so we can read WINDOW_UPDATE frames
+        const writePromise = (async () => {
+            if (bodyMode.kind === 'bytes') {
+                await writeDataBytes(frameWriter, windowTracker, streamId, bodyMode.bytes, true);
+            } else if (bodyMode.kind === 'stream') {
+                await writeDataStream(frameWriter, windowTracker, streamId, bodyMode.stream);
+            }
+        })().catch(err => {
+            console.error('HTTP/2 write error:', err);
+            try { tunnel.socket.close(); } catch (_) { /* noop */ }
+        });
+
+        return await readResponse(frameReader, frameWriter, streamId, hpackDecoder, tunnel.socket, windowTracker);
     } catch (err) {
         try { frameReader.releaseLock(); } catch (_) { /* noop */ }
         try { frameWriter.releaseLock(); } catch (_) { /* noop */ }
@@ -213,6 +221,65 @@ class H2FrameReader {
 
     releaseLock() {
         this.reader.releaseLock();
+    }
+}
+
+class WindowTracker {
+    constructor(initialWindowSize = 65535, maxFrameSize = DEFAULT_MAX_FRAME_SIZE) {
+        this.connectionWindow = initialWindowSize;
+        this.streamWindows = new Map();
+        this.streamWindows.set(1, initialWindowSize); // Stream 1 supported initially
+        this.initialWindowSize = initialWindowSize;
+        this.maxFrameSize = maxFrameSize;
+        this.waiters = [];
+    }
+
+    updateMaxFrameSize(size) {
+        this.maxFrameSize = Math.max(16384, Math.min(size, 16777215));
+        this._notify();
+    }
+    
+    updateInitialWindowSize(newSize) {
+        const diff = newSize - this.initialWindowSize;
+        this.initialWindowSize = newSize;
+        for (const [id, current] of this.streamWindows.entries()) {
+            this.streamWindows.set(id, current + diff);
+        }
+        this._notify();
+    }
+
+    addCredits(streamId, increment) {
+        if (streamId === 0) {
+            this.connectionWindow += increment;
+        } else {
+            const current = this.streamWindows.get(streamId) || this.initialWindowSize;
+            this.streamWindows.set(streamId, current + increment);
+        }
+        this._notify();
+    }
+
+    async waitForCredits(streamId, requestedBytes) {
+        while (true) {
+            const streamWin = this.streamWindows.get(streamId) || this.initialWindowSize;
+            const available = Math.min(this.connectionWindow, streamWin, this.maxFrameSize);
+            
+            if (available > 0) {
+                const take = Math.min(available, requestedBytes);
+                this.connectionWindow -= take;
+                this.streamWindows.set(streamId, streamWin - take);
+                return take;
+            }
+            
+            await new Promise(resolve => this.waiters.push(resolve));
+        }
+    }
+
+    _notify() {
+        if (this.waiters.length > 0) {
+            const resolveAll = this.waiters;
+            this.waiters = [];
+            for (const r of resolveAll) r();
+        }
     }
 }
 
@@ -334,7 +401,7 @@ class HpackDecoder {
     }
 }
 
-async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, socket) {
+async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, socket, windowTracker) {
     const headers = new Headers();
     let status = 200;
     let statusSeen = false;
@@ -346,11 +413,19 @@ async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, so
         const frame = await frameReader.readFrame();
 
         if (frame.streamId === 0) {
-            await handleConnectionFrame(frameWriter, frame);
+            await handleConnectionFrame(frameWriter, frame, windowTracker);
             continue;
         }
 
         if (frame.streamId !== streamId) {
+            continue;
+        }
+
+        if (frame.type === FRAME_WINDOW_UPDATE) {
+            if (frame.payload.byteLength === 4) {
+                const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                windowTracker.addCredits(streamId, increment);
+            }
             continue;
         }
 
@@ -429,11 +504,12 @@ async function readResponse(frameReader, frameWriter, streamId, hpackDecoder, so
         initialBodyChunks,
         streamEnded,
         socket,
+        windowTracker,
     });
     return new Response(bodyStream, { status, headers });
 }
 
-async function handleConnectionFrame(frameWriter, frame) {
+async function handleConnectionFrame(frameWriter, frame, windowTracker) {
     if (frame.type === FRAME_SETTINGS) {
         if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
             return;
@@ -441,7 +517,26 @@ async function handleConnectionFrame(frameWriter, frame) {
         if ((frame.payload.byteLength % 6) !== 0) {
             throw new Error('HTTP/2: invalid SETTINGS payload length');
         }
+        
+        for (let i = 0; i < frame.payload.byteLength; i += 6) {
+            const id = (frame.payload[i] << 8) | frame.payload[i + 1];
+            const val = (frame.payload[i+2] << 24) | (frame.payload[i+3] << 16) | (frame.payload[i+4] << 8) | frame.payload[i+5];
+            if (id === 0x4) { // SETTINGS_INITIAL_WINDOW_SIZE
+                windowTracker.updateInitialWindowSize(val);
+            } else if (id === 0x5) { // SETTINGS_MAX_FRAME_SIZE
+                windowTracker.updateMaxFrameSize(val);
+            }
+        }
+
         await writeFrame(frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
+        return;
+    }
+
+    if (frame.type === FRAME_WINDOW_UPDATE) {
+        if (frame.payload.byteLength === 4) {
+            const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+            windowTracker.addCredits(0, increment);
+        }
         return;
     }
 
@@ -519,6 +614,7 @@ function createHttp2BodyStream({
     initialBodyChunks,
     streamEnded,
     socket,
+    windowTracker,
 }) {
     const queue = [...initialBodyChunks];
     let done = streamEnded;
@@ -538,11 +634,19 @@ function createHttp2BodyStream({
             const frame = await frameReader.readFrame();
 
             if (frame.streamId === 0) {
-                await handleConnectionFrame(frameWriter, frame);
+                await handleConnectionFrame(frameWriter, frame, windowTracker);
                 continue;
             }
 
             if (frame.streamId !== streamId) {
+                continue;
+            }
+
+            if (frame.type === FRAME_WINDOW_UPDATE) {
+                if (frame.payload.byteLength === 4) {
+                    const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                    windowTracker.addCredits(streamId, increment);
+                }
                 continue;
             }
 
@@ -952,14 +1056,16 @@ async function writeHeaderBlock(writer, streamId, headerBlock, endStream) {
     }
 }
 
-async function writeDataBytes(writer, streamId, bytes, endStream) {
+async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream) {
     if (!(bytes instanceof Uint8Array)) {
         bytes = new Uint8Array(bytes);
     }
 
     let offset = 0;
     while (offset < bytes.byteLength) {
-        const take = Math.min(DEFAULT_MAX_FRAME_SIZE, bytes.byteLength - offset);
+        const remaining = bytes.byteLength - offset;
+        const take = await windowTracker.waitForCredits(streamId, remaining);
+
         const chunk = bytes.subarray(offset, offset + take);
         offset += take;
         const flags = (offset >= bytes.byteLength && endStream) ? FLAG_END_STREAM : 0x00;
@@ -971,14 +1077,14 @@ async function writeDataBytes(writer, streamId, bytes, endStream) {
     }
 }
 
-async function writeDataStream(writer, streamId, stream) {
+async function writeDataStream(writer, windowTracker, streamId, stream) {
     const reader = stream.getReader();
     try {
         while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-            await writeDataBytes(writer, streamId, chunk, false);
+            await writeDataBytes(writer, windowTracker, streamId, chunk, false);
         }
         await writeFrame(writer, FRAME_DATA, FLAG_END_STREAM, streamId, new Uint8Array(0));
     } finally {
