@@ -18,6 +18,7 @@ import { proxyFetchHttp2 } from './proxy-fetch-http2.js';
 
 const CR = 0x0D;
 const LF = 0x0A;
+const textEncoder = new TextEncoder();
 
 // Security limits — tuned for Cloudflare Workers (128MB memory ceiling)
 const MAX_HEADER_SIZE = 128 * 1024;          // 128KB max response headers
@@ -81,58 +82,49 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port) || (isHttps ? 443 : 80);
     const tlsHostname = options.tlsHostname || targetHost;
+    const signal = requestInit.signal;
+    let tunnel = null;
+    let abortHandler = null;
+
+    throwIfAborted(signal);
+    const bodyMode = await normalizeHttp11Body(requestInit.body);
 
     // Establish SOCKS5 tunnel (with WASM TLS if HTTPS)
-    const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
+    tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
         enableTls: isHttps,
         tlsHostname,
         alpnProtocols: isHttps ? ['http/1.1'] : undefined,
+        signal,
     });
+    abortHandler = signal
+        ? () => {
+            try { tunnel.socket.close(); } catch (_) { /* noop */ }
+        }
+        : null;
+    if (signal) signal.addEventListener('abort', abortHandler, { once: true });
 
     try {
         // Build and send raw HTTP/1.1 request
-        const requestBytes = buildHttpRequest(url, requestInit);
+        throwIfAborted(signal);
+        const requestBytes = buildHttpRequest(url, requestInit, bodyMode);
         const writer = tunnel.writable.getWriter();
         try {
             await writer.write(requestBytes);
+            await writeHttp11Body(writer, bodyMode, signal);
         } catch (err) {
+            if (signal && signal.aborted) throw makeAbortError(signal);
             const msg = err && err.message ? err.message : String(err);
-            try { writer.releaseLock(); } catch (_) { /* noop */ }
             throw new Error(`Failed writing HTTP request: ${msg}`);
-        }
-
-        // Write request body if present
-        if (requestInit.body) {
-            if (typeof requestInit.body === 'string') {
-                await writer.write(new TextEncoder().encode(requestInit.body));
-                writer.releaseLock();
-            } else if (requestInit.body instanceof ReadableStream) {
-                writer.releaseLock();
-                const bodyReader = requestInit.body.getReader();
-                const bodyWriter = tunnel.writable.getWriter();
-                try {
-                    while (true) {
-                        const { value, done } = await bodyReader.read();
-                        if (done) break;
-                        await bodyWriter.write(value);
-                    }
-                } finally {
-                    bodyWriter.releaseLock();
-                }
-            } else if (requestInit.body instanceof ArrayBuffer || requestInit.body instanceof Uint8Array) {
-                await writer.write(new Uint8Array(requestInit.body));
-                writer.releaseLock();
-            } else {
-                writer.releaseLock();
-            }
-        } else {
-            writer.releaseLock();
+        } finally {
+            try { writer.releaseLock(); } catch (_) { /* noop */ }
         }
 
         // Parse response — binary header scanning, then stream body
-        return await parseResponseBinary(tunnel.readable, tunnel.socket);
+        if (signal) signal.removeEventListener('abort', abortHandler);
+        return await parseResponseBinary(tunnel.readable, tunnel.socket, signal);
 
     } catch (err) {
+        if (signal) signal.removeEventListener('abort', abortHandler);
         try { await tunnel.socket.close(); } catch (_) { /* best-effort */ }
         throw err;
     }
@@ -140,7 +132,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
 
 // ─── HTTP Request Builder ───────────────────────────────────────────
 
-function buildHttpRequest(url, init) {
+function buildHttpRequest(url, init, bodyMode) {
     // ── Build HTTP Request ──
     const method = (init.method || 'GET').toUpperCase();
     if (!/^[A-Z]+$/.test(method)) {
@@ -185,9 +177,14 @@ function buildHttpRequest(url, init) {
     // Cloudflare's Edge will automatically re-compress the final response for the user.
     headers.set('Accept-Encoding', 'identity');
 
-    // Auto Content-Length for string bodies
-    if (init.body && typeof init.body === 'string' && !headers.has('Content-Length')) {
-        headers.set('Content-Length', new TextEncoder().encode(init.body).byteLength.toString());
+    headers.delete('Transfer-Encoding');
+    if (bodyMode.kind === 'bytes') {
+        headers.set('Content-Length', bodyMode.bytes.byteLength.toString());
+    } else if (bodyMode.kind === 'stream') {
+        headers.delete('Content-Length');
+        headers.set('Transfer-Encoding', 'chunked');
+    } else {
+        headers.delete('Content-Length');
     }
 
     let str = `${method} ${path} HTTP/1.1\r\n`;
@@ -201,9 +198,22 @@ function buildHttpRequest(url, init) {
 
 // ─── Binary HTTP Response Parser ────────────────────────────────────
 
-async function parseResponseBinary(readable, socket) {
+async function parseResponseBinary(readable, socket, signal) {
     const reader = readable.getReader();
     const decoder = new TextDecoder();
+    let abortHandler = null;
+    const cleanupAbort = () => {
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+        abortHandler = null;
+    };
+
+    if (signal) {
+        abortHandler = () => {
+            try { reader.cancel(); } catch (_) { /* noop */ }
+            try { socket.close(); } catch (_) { /* noop */ }
+        };
+        signal.addEventListener('abort', abortHandler, { once: true });
+    }
 
     // Accumulate bytes until we find \r\n\r\n (bounded to prevent memory DoS)
     let buffers = [];
@@ -212,6 +222,7 @@ async function parseResponseBinary(readable, socket) {
     let combined = null;
 
     while (headerEndOffset === -1) {
+        throwIfAborted(signal);
         let chunk;
         try {
             chunk = await reader.read();
@@ -269,6 +280,7 @@ async function parseResponseBinary(readable, socket) {
     // ── Handle null-body statuses ──
     const nullBodyStatuses = [101, 204, 205, 304];
     if (nullBodyStatuses.includes(status)) {
+        cleanupAbort();
         reader.cancel().catch(() => { });
         try { socket.close(); } catch (_) { /* noop */ }
         return new Response(null, { status, statusText, headers: responseHeaders });
@@ -283,12 +295,12 @@ async function parseResponseBinary(readable, socket) {
     let bodyStream;
 
     if (isChunked) {
-        bodyStream = createChunkedStream(reader, bodyRemainder, socket);
+        bodyStream = createChunkedStream(reader, bodyRemainder, socket, signal, cleanupAbort);
         responseHeaders.delete('transfer-encoding');
     } else if (contentLength !== null && contentLength >= 0) {
-        bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket);
+        bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket, signal, cleanupAbort);
     } else {
-        bodyStream = createDirectStream(reader, bodyRemainder);
+        bodyStream = createDirectStream(reader, bodyRemainder, socket, signal, cleanupAbort);
     }
 
     return new Response(bodyStream, { status, statusText, headers: responseHeaders });
@@ -299,14 +311,16 @@ async function parseResponseBinary(readable, socket) {
 /**
  * Content-Length stream — reads exactly `contentLength` bytes then closes.
  */
-function createContentLengthStream(reader, initialData, contentLength, socket) {
+function createContentLengthStream(reader, initialData, contentLength, socket, signal, cleanup) {
     let bytesRemaining = contentLength;
     let sentInitial = false;
 
     return new ReadableStream({
         pull(controller) {
+            throwIfAborted(signal);
             if (bytesRemaining <= 0) {
                 controller.close();
+                cleanup();
                 try { socket.close(); } catch (_) { /* noop */ }
                 return;
             }
@@ -318,6 +332,7 @@ function createContentLengthStream(reader, initialData, contentLength, socket) {
                         controller.enqueue(initialData.subarray(0, bytesRemaining));
                         bytesRemaining = 0;
                         controller.close();
+                        cleanup();
                         try { socket.close(); } catch (_) { /* noop */ }
                         return;
                     }
@@ -336,16 +351,19 @@ function createContentLengthStream(reader, initialData, contentLength, socket) {
                     controller.enqueue(value.subarray(0, bytesRemaining));
                     bytesRemaining = 0;
                     controller.close();
+                    cleanup();
                     try { socket.close(); } catch (_) { /* noop */ }
                 } else {
                     bytesRemaining -= value.byteLength;
                     controller.enqueue(value);
                 }
             }).catch(() => {
+                cleanup();
                 controller.close();
             });
         },
         cancel() {
+            cleanup();
             reader.cancel();
             try { socket.close(); } catch (_) { /* noop */ }
         },
@@ -355,12 +373,13 @@ function createContentLengthStream(reader, initialData, contentLength, socket) {
 /**
  * Chunked transfer encoding decoder — fully binary.
  */
-function createChunkedStream(reader, initialData, socket) {
+function createChunkedStream(reader, initialData, socket, signal, cleanup) {
     let buffer = initialData;
     let streamDone = false;
 
     return new ReadableStream({
         async pull(controller) {
+            throwIfAborted(signal);
             if (streamDone) { controller.close(); return; }
 
             while (true) {
@@ -368,7 +387,7 @@ function createChunkedStream(reader, initialData, socket) {
 
                 if (lineEnd === -1) {
                     const result = await reader.read();
-                    if (result.done) { streamDone = true; controller.close(); return; }
+                    if (result.done) { streamDone = true; cleanup(); controller.close(); return; }
                     buffer = appendBuffer(buffer, result.value);
                     continue;
                 }
@@ -377,11 +396,12 @@ function createChunkedStream(reader, initialData, socket) {
                 const chunkSize = parseInt(sizeStr.split(';')[0], 16);
 
                 if (isNaN(chunkSize) || chunkSize < 0 || chunkSize > MAX_CHUNK_SIZE) {
-                    streamDone = true; controller.close(); return;
+                    streamDone = true; cleanup(); controller.close(); return;
                 }
 
                 if (chunkSize === 0) {
                     streamDone = true;
+                    cleanup();
                     controller.close();
                     try { socket.close(); } catch (_) { /* noop */ }
                     return;
@@ -397,7 +417,7 @@ function createChunkedStream(reader, initialData, socket) {
                         if (buffer.byteLength > 0) {
                             controller.enqueue(buffer.subarray(0, Math.min(buffer.byteLength, chunkSize)));
                         }
-                        streamDone = true; controller.close(); return;
+                            streamDone = true; cleanup(); controller.close(); return;
                     }
                     buffer = appendBuffer(buffer, result.value);
                 }
@@ -410,6 +430,7 @@ function createChunkedStream(reader, initialData, socket) {
             }
         },
         cancel() {
+            cleanup();
             reader.cancel();
             try { socket.close(); } catch (_) { /* noop */ }
         },
@@ -419,10 +440,11 @@ function createChunkedStream(reader, initialData, socket) {
 /**
  * Direct stream — pipe until close (no Content-Length, not chunked).
  */
-function createDirectStream(reader, initialData) {
+function createDirectStream(reader, initialData, socket, signal, cleanup) {
     let sentInitial = false;
     return new ReadableStream({
         pull(controller) {
+            throwIfAborted(signal);
             if (!sentInitial) {
                 sentInitial = true;
                 if (initialData.byteLength > 0) {
@@ -431,12 +453,78 @@ function createDirectStream(reader, initialData) {
                 }
             }
             return reader.read().then(({ value, done }) => {
-                if (done) controller.close();
+                if (done) {
+                    cleanup();
+                    controller.close();
+                }
                 else controller.enqueue(value);
-            }).catch(() => controller.close());
+            }).catch(() => {
+                cleanup();
+                controller.close();
+            });
         },
-        cancel() { reader.cancel(); },
+        cancel() {
+            cleanup();
+            reader.cancel();
+            try { socket.close(); } catch (_) { /* noop */ }
+        },
     });
+}
+
+async function normalizeHttp11Body(body) {
+    if (body == null) return { kind: 'none' };
+    if (typeof body === 'string') return { kind: 'bytes', bytes: textEncoder.encode(body) };
+    if (body instanceof Uint8Array) return { kind: 'bytes', bytes: body };
+    if (body instanceof ArrayBuffer) return { kind: 'bytes', bytes: new Uint8Array(body) };
+    if (ArrayBuffer.isView(body)) {
+        return { kind: 'bytes', bytes: new Uint8Array(body.buffer, body.byteOffset, body.byteLength) };
+    }
+    if (typeof URLSearchParams === 'function' && body instanceof URLSearchParams) {
+        return { kind: 'bytes', bytes: textEncoder.encode(body.toString()) };
+    }
+    if (typeof Blob === 'function' && body instanceof Blob) {
+        return { kind: 'bytes', bytes: new Uint8Array(await body.arrayBuffer()) };
+    }
+    if (body instanceof ReadableStream) return { kind: 'stream', stream: body };
+    return { kind: 'bytes', bytes: textEncoder.encode(String(body)) };
+}
+
+async function writeHttp11Body(writer, bodyMode, signal) {
+    throwIfAborted(signal);
+    if (bodyMode.kind === 'none') return;
+    if (bodyMode.kind === 'bytes') {
+        if (bodyMode.bytes.byteLength > 0) await writer.write(bodyMode.bytes);
+        return;
+    }
+
+    const reader = bodyMode.stream.getReader();
+    try {
+        while (true) {
+            throwIfAborted(signal);
+            const { value, done } = await reader.read();
+            if (done) break;
+            const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+            if (chunk.byteLength === 0) continue;
+            await writer.write(textEncoder.encode(`${chunk.byteLength.toString(16)}\r\n`));
+            await writer.write(chunk);
+            await writer.write(textEncoder.encode('\r\n'));
+        }
+        await writer.write(textEncoder.encode('0\r\n\r\n'));
+    } finally {
+        try { reader.releaseLock(); } catch (_) { /* noop */ }
+    }
+}
+
+function makeAbortError(signal) {
+    if (signal && signal.reason instanceof Error) return signal.reason;
+    if (typeof DOMException === 'function') return new DOMException('Aborted', 'AbortError');
+    const err = new Error('Aborted');
+    err.name = 'AbortError';
+    return err;
+}
+
+function throwIfAborted(signal) {
+    if (signal && signal.aborted) throw makeAbortError(signal);
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────

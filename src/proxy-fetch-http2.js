@@ -162,6 +162,7 @@ class Http2Connection {
 
     async fetch(url, requestInit) {
         if (this.closed) throw this.closeError || new Error('HTTP/2 Connection Closed');
+        throwIfAborted(requestInit.signal);
 
         // M2: Stream ID exhaustion check
         if (this.nextStreamId > MAX_STREAM_ID) {
@@ -178,53 +179,76 @@ class Http2Connection {
 
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
+        let headersSent = false;
 
-        await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
+        let resolveResponse;
+        let rejectResponse;
+        const responsePromise = new Promise((resolve, reject) => {
+            resolveResponse = resolve;
+            rejectResponse = reject;
+        });
 
-        let abortHandler = null;
+        const streamState = {
+            responseDeferred: { resolve: resolveResponse, reject: rejectResponse },
+            controller: null,
+            pushBuffer: [],
+            responseHeaders: new Headers(),
+            status: 200,
+            abortHandler: null,
+            signal: requestInit.signal,
+            endStreamSeen: false
+        };
+        this.streams.set(streamId, streamState);
+
         if (requestInit.signal) {
-            abortHandler = async () => {
-                await writeFrame(this.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8])); // CANCEL
+            streamState.abortHandler = async () => {
+                if (headersSent) {
+                    try {
+                        await writeFrame(this.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8])); // CANCEL
+                    } catch (_) {
+                        // Connection may already be closed by the abort.
+                    }
+                }
                 const s = this.streams.get(streamId);
                 if (s) {
-                    s.responseDeferred.reject(new DOMException('Aborted', 'AbortError'));
-                    if (s.controller) s.controller.error(new DOMException('Aborted', 'AbortError'));
-                    this.streams.delete(streamId);
+                    const err = makeAbortError(requestInit.signal);
+                    s.responseDeferred.reject(err);
+                    if (s.controller) s.controller.error(err);
+                    this._cleanupStream(streamId);
                 }
             };
-            requestInit.signal.addEventListener('abort', abortHandler);
+            requestInit.signal.addEventListener('abort', streamState.abortHandler, { once: true });
+            if (requestInit.signal.aborted) {
+                void streamState.abortHandler();
+            }
         }
 
-        return new Promise((resolve, reject) => {
-            const streamState = {
-                responseDeferred: { resolve, reject },
-                controller: null,
-                pushBuffer: [],
-                responseHeaders: new Headers(),
-                status: 200,
-                abortHandler,
-                signal: requestInit.signal,
-                endStreamSeen: false
-            };
-            this.streams.set(streamId, streamState);
+        try {
+            await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
+            headersSent = true;
+        } catch (err) {
+            this._cleanupStream(streamId);
+            throw err;
+        }
 
-            if (hasBody) {
-                (async () => {
-                    try {
-                        if (bodyMode.kind === 'bytes') {
-                            await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
-                        } else if (bodyMode.kind === 'stream') {
-                            await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
-                        }
-                    } catch (err) {
-                        if (this.streams.has(streamId)) {
-                            reject(err);
-                            this._cleanupStream(streamId);
-                        }
+        if (hasBody) {
+            void (async () => {
+                try {
+                    if (bodyMode.kind === 'bytes') {
+                        await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
+                    } else if (bodyMode.kind === 'stream') {
+                        await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
                     }
-                })();
-            }
-        });
+                } catch (err) {
+                    if (this.streams.has(streamId)) {
+                        rejectResponse(err);
+                        this._cleanupStream(streamId);
+                    }
+                }
+            })();
+        }
+
+        return responsePromise;
     }
 
     async _startReadLoop() {
@@ -1167,4 +1191,16 @@ function concatChunks(chunks) {
         offset += c.byteLength;
     }
     return out;
+}
+
+function makeAbortError(signal) {
+    if (signal && signal.reason instanceof Error) return signal.reason;
+    if (typeof DOMException === 'function') return new DOMException('Aborted', 'AbortError');
+    const err = new Error('Aborted');
+    err.name = 'AbortError';
+    return err;
+}
+
+function throwIfAborted(signal) {
+    if (signal && signal.aborted) throw makeAbortError(signal);
 }

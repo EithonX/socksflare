@@ -39,9 +39,12 @@ export class Socks5Client {
             throw new Error('socksflare: host is required');
         }
         this.host = config.host;
-        this.port = parseInt(config.port) || 1080;
-        this.username = config.username || config.user || undefined;
-        this.password = config.password || config.pass || undefined;
+        this.port = parseInt(config.port ?? 1080, 10);
+        if (!Number.isInteger(this.port) || this.port < 1 || this.port > 65535) {
+            throw new Error(`socksflare: invalid proxy port: ${config.port}`);
+        }
+        this.username = config.username ?? config.user ?? undefined;
+        this.password = config.password ?? config.pass ?? undefined;
         this._http2Pool = new Map();
     }
 

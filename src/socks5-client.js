@@ -125,15 +125,24 @@ function parseAddress(host) {
 
 function ipv6ToBytes(ipv6) {
   ipv6 = ipv6.replace(/^\[|\]$/g, '');
-  const parts = ipv6.split('::');
-  let groups;
-  if (parts.length === 2) {
-    const left = parts[0] ? parts[0].split(':') : [];
-    const right = parts[1] ? parts[1].split(':') : [];
-    groups = [...left, ...Array(8 - left.length - right.length).fill('0'), ...right];
-  } else {
-    groups = ipv6.split(':');
+  if (!ipv6 || (ipv6.match(/::/g) || []).length > 1) {
+    throw new Error(`SOCKS5: invalid IPv6 address: ${ipv6}`);
   }
+
+  const parts = ipv6.split('::');
+  const hasCompression = parts.length === 2;
+  const left = parseIpv6Groups(parts[0]);
+  const right = hasCompression ? parseIpv6Groups(parts[1]) : [];
+  const missing = 8 - left.length - right.length;
+
+  if ((hasCompression && missing < 1) || (!hasCompression && left.length !== 8)) {
+    throw new Error(`SOCKS5: invalid IPv6 address: ${ipv6}`);
+  }
+
+  const groups = hasCompression
+    ? [...left, ...Array(missing).fill('0'), ...right]
+    : left;
+
   const bytes = new Uint8Array(16);
   for (let i = 0; i < 8; i++) {
     const val = parseInt(groups[i], 16);
@@ -141,6 +150,57 @@ function ipv6ToBytes(ipv6) {
     bytes[i * 2 + 1] = val & 0xFF;
   }
   return bytes;
+}
+
+function parseIpv6Groups(part) {
+  if (!part) return [];
+  const rawGroups = part.split(':');
+  const groups = [];
+
+  for (let i = 0; i < rawGroups.length; i++) {
+    const group = rawGroups[i];
+    if (group.includes('.')) {
+      if (i !== rawGroups.length - 1) {
+        throw new Error(`SOCKS5: invalid IPv6 IPv4-tail group: ${group}`);
+      }
+      const ipv4 = parseIpv4Bytes(group);
+      groups.push(((ipv4[0] << 8) | ipv4[1]).toString(16));
+      groups.push(((ipv4[2] << 8) | ipv4[3]).toString(16));
+      continue;
+    }
+    if (!/^[0-9a-fA-F]{1,4}$/.test(group)) {
+      throw new Error(`SOCKS5: invalid IPv6 group: ${group}`);
+    }
+    groups.push(group);
+  }
+
+  return groups;
+}
+
+function parseIpv4Bytes(host) {
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!ipv4Match) {
+    throw new Error(`SOCKS5: invalid IPv4 address: ${host}`);
+  }
+  const bytes = new Uint8Array(4);
+  for (let i = 0; i < 4; i++) {
+    const octet = parseInt(ipv4Match[i + 1], 10);
+    if (octet > 255) throw new Error(`SOCKS5: invalid IPv4 octet: ${octet}`);
+    bytes[i] = octet;
+  }
+  return bytes;
+}
+
+function makeAbortError(signal) {
+  if (signal && signal.reason instanceof Error) return signal.reason;
+  if (typeof DOMException === 'function') return new DOMException('Aborted', 'AbortError');
+  const err = new Error('Aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw makeAbortError(signal);
 }
 
 // ─── Core SOCKS5 Connection ─────────────────────────────────────────
@@ -167,9 +227,14 @@ function ipv6ToBytes(ipv6) {
  */
 export async function socks5Connect(proxyConfig, targetHost, targetPort, options = {}) {
   const { hostname: proxyHost, port: proxyPort = 1080, username, password } = proxyConfig;
+  const signal = options.signal;
 
+  throwIfAborted(signal);
   if (!proxyHost || typeof proxyHost !== 'string') {
     throw new Error('SOCKS5: proxy hostname is required');
+  }
+  if (!Number.isInteger(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+    throw new Error(`SOCKS5: invalid proxy port: ${proxyPort}`);
   }
   if (!targetHost || typeof targetHost !== 'string') {
     throw new Error('SOCKS5: target host is required');
@@ -177,15 +242,25 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
   if (!Number.isInteger(targetPort) || targetPort < 1 || targetPort > 65535) {
     throw new Error(`SOCKS5: invalid target port: ${targetPort}`);
   }
+  if ((username === undefined) !== (password === undefined)) {
+    throw new Error('SOCKS5: username and password must be provided together');
+  }
 
-  const useAuth = !!(username && password);
+  const useAuth = username !== undefined && password !== undefined;
   const enableTls = options.enableTls || false;
   const tlsHostname = options.tlsHostname || targetHost;
   const alpnProtocols = Array.isArray(options.alpnProtocols) ? options.alpnProtocols : undefined;
 
   // Connect to SOCKS5 proxy over plain TCP — always unencrypted at this layer.
   const socket = connect({ hostname: proxyHost, port: proxyPort });
+  const abortHandler = signal
+    ? () => {
+        try { socket.close(); } catch (_) { /* noop */ }
+      }
+    : null;
+  if (signal) signal.addEventListener('abort', abortHandler, { once: true });
   await socket.opened;
+  throwIfAborted(signal);
 
   const writer = socket.writable.getWriter();
   const rawReader = socket.readable.getReader();
@@ -197,8 +272,10 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
       ? new Uint8Array([SOCKS_VERSION, 2, AUTH_NONE, AUTH_USERPASS])
       : new Uint8Array([SOCKS_VERSION, 1, AUTH_NONE]);
     await writer.write(methodReq);
+    throwIfAborted(signal);
 
     const methodResp = await reader.readExact(2);
+    throwIfAborted(signal);
     if (methodResp[0] !== SOCKS_VERSION) {
       throw new Error(`SOCKS5: bad version: ${methodResp[0]}`);
     }
@@ -214,6 +291,12 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
       const encoder = new TextEncoder();
       const userBytes = encoder.encode(username);
       const passBytes = encoder.encode(password);
+      if (userBytes.length > 255) {
+        throw new Error(`SOCKS5: username too long (${userBytes.length} bytes, max 255)`);
+      }
+      if (passBytes.length > 255) {
+        throw new Error(`SOCKS5: password too long (${passBytes.length} bytes, max 255)`);
+      }
       const authReq = new Uint8Array(1 + 1 + userBytes.length + 1 + passBytes.length);
       let o = 0;
       authReq[o++] = AUTH_USERPASS_VERSION;
@@ -222,8 +305,10 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
       authReq[o++] = passBytes.length;
       authReq.set(passBytes, o);
       await writer.write(authReq);
+      throwIfAborted(signal);
 
       const authResp = await reader.readExact(2);
+      throwIfAborted(signal);
       if (authResp[1] !== AUTH_USERPASS_SUCCESS) {
         throw new Error('SOCKS5: authentication failed');
       }
@@ -241,9 +326,11 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
     connReq[o++] = (targetPort >> 8) & 0xFF;
     connReq[o++] = targetPort & 0xFF;
     await writer.write(connReq);
+    throwIfAborted(signal);
 
     // ── CONNECT Response ──
     const connResp = await reader.readExact(4);
+    throwIfAborted(signal);
     if (connResp[0] !== SOCKS_VERSION) {
       throw new Error(`SOCKS5: bad version in reply: ${connResp[0]}`);
     }
@@ -274,12 +361,15 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
       const tlsTunnel = await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname, {
         alpnProtocols,
       });
+      if (signal) signal.removeEventListener('abort', abortHandler);
       return { socket, ...tlsTunnel };
     }
 
+    if (signal) signal.removeEventListener('abort', abortHandler);
     return { socket, readable: socket.readable, writable: socket.writable };
 
   } catch (err) {
+    if (signal) signal.removeEventListener('abort', abortHandler);
     try { reader.releaseLock(); } catch (_) { /* already released */ }
     try { writer.releaseLock(); } catch (_) { /* already released */ }
     try { await socket.close(); } catch (_) { /* best-effort cleanup */ }
