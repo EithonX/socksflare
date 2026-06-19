@@ -140,11 +140,12 @@ class Http2Connection {
         this.poolKey = poolKey;
         this.frameReader = new H2FrameReader(tunnel.readable.getReader());
         this.frameWriter = tunnel.writable.getWriter();
-        this.hpackDecoder = new HpackDecoder(ADVERTISED_HEADER_TABLE_SIZE);
+        this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
         this.windowTracker = new WindowTracker();
 
         this.nextStreamId = 1;
         this.streams = new Map();
+        this.settingsAckPending = false;
 
         this.closed = false;
         this.closeError = null;
@@ -158,6 +159,7 @@ class Http2Connection {
             [SETTINGS_HEADER_TABLE_SIZE, ADVERTISED_HEADER_TABLE_SIZE],
             [SETTINGS_ENABLE_PUSH, 0],
         ]));
+        this.settingsAckPending = true;
     }
 
     async fetch(url, requestInit) {
@@ -261,10 +263,21 @@ class Http2Connection {
                 if (frame.streamId === 0) {
                     floodCounter++;
                     if (frame.type === FRAME_SETTINGS) {
-                        if ((frame.flags & FLAG_ACK) === 0) {
+                        if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
+                            if (frame.payload.byteLength !== 0) {
+                                throw new Error('HTTP/2: SETTINGS ACK with non-empty payload');
+                            }
+                            if (this.settingsAckPending) {
+                                this.settingsAckPending = false;
+                                this.hpackDecoder.setSettingsMaxDynamicSize(ADVERTISED_HEADER_TABLE_SIZE);
+                            }
+                        } else {
+                            if (frame.payload.byteLength % 6 !== 0) {
+                                throw new Error('HTTP/2: malformed SETTINGS payload length');
+                            }
                             for (let i = 0; i < frame.payload.byteLength; i += 6) {
-                                const id = (frame.payload[i] << 8) | frame.payload[i + 1];
-                                const val = (frame.payload[i + 2] << 24) | (frame.payload[i + 3] << 16) | (frame.payload[i + 4] << 8) | frame.payload[i + 5];
+                                const id = readUint16(frame.payload, i);
+                                const val = readUint32(frame.payload, i + 2);
                                 if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
                                 else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
                             }
@@ -275,11 +288,11 @@ class Http2Connection {
                             await writeFrame(this.frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
                         }
                     } else if (frame.type === FRAME_GOAWAY) {
-                        const errorCode = frame.payload.byteLength >= 8 ? ((frame.payload[4] << 24) | (frame.payload[5] << 16) | (frame.payload[6] << 8) | frame.payload[7]) : 0;
+                        const errorCode = frame.payload.byteLength >= 8 ? readUint32(frame.payload, 4) : 0;
                         throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
                     } else if (frame.type === FRAME_WINDOW_UPDATE) {
                         if (frame.payload.byteLength === 4) {
-                            const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                            const increment = readUint31(frame.payload, 0);
                             // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
                             if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
                             this.windowTracker.addCredits(0, increment);
@@ -298,7 +311,7 @@ class Http2Connection {
 
                 if (frame.type === FRAME_WINDOW_UPDATE) {
                     if (frame.payload.byteLength === 4) {
-                        const increment = ((frame.payload[0] & 0x7f) << 24) | (frame.payload[1] << 16) | (frame.payload[2] << 8) | frame.payload[3];
+                        const increment = readUint31(frame.payload, 0);
                         // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
                         if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
                         this.windowTracker.addCredits(frame.streamId, increment);
@@ -617,6 +630,7 @@ class HpackDecoder {
         this.dynamicTable = [];
         this.dynamicTableSize = 0;
         this.maxDynamicSize = maxDynamicSize;
+        this.settingsMaxDynamicSize = maxDynamicSize;
     }
 
     decode(headerBlock) {
@@ -730,9 +744,18 @@ class HpackDecoder {
 
     // M1: Reject dynamic table size updates exceeding our SETTINGS_HEADER_TABLE_SIZE
     updateDynamicSize(newSize) {
-        if (newSize > ADVERTISED_HEADER_TABLE_SIZE) {
-            throw new Error(`HTTP/2 HPACK: dynamic table size update (${newSize}) exceeds SETTINGS limit (${ADVERTISED_HEADER_TABLE_SIZE})`);
+        if (newSize > this.settingsMaxDynamicSize) {
+            throw new Error(`HTTP/2 HPACK: dynamic table size update (${newSize}) exceeds SETTINGS limit (${this.settingsMaxDynamicSize})`);
         }
+        this.setMaxDynamicSize(newSize);
+    }
+
+    setSettingsMaxDynamicSize(newSize) {
+        this.settingsMaxDynamicSize = newSize;
+        this.setMaxDynamicSize(Math.min(this.maxDynamicSize, newSize));
+    }
+
+    setMaxDynamicSize(newSize) {
         this.maxDynamicSize = newSize;
         while (this.dynamicTableSize > this.maxDynamicSize && this.dynamicTable.length > 0) {
             const evicted = this.dynamicTable.pop();
@@ -770,6 +793,9 @@ function parseHeadersPayload(payload, flags) {
     let padLength = 0;
 
     if ((flags & FLAG_PADDED) === FLAG_PADDED) {
+        if (payload.byteLength < 1) {
+            throw new Error('HTTP/2: malformed padded HEADERS payload');
+        }
         padLength = payload[offset];
         offset += 1;
     }
@@ -795,6 +821,9 @@ function parseDataPayload(payload, flags) {
     let padLength = 0;
 
     if ((flags & FLAG_PADDED) === FLAG_PADDED) {
+        if (payload.byteLength < 1) {
+            throw new Error('HTTP/2: malformed padded DATA payload');
+        }
         padLength = payload[offset];
         offset += 1;
     }
@@ -1145,6 +1174,18 @@ function buildSettingsPayload(pairs) {
         payload[o++] = value & 0xff;
     }
     return payload;
+}
+
+function readUint16(buf, offset) {
+    return (buf[offset] << 8) | buf[offset + 1];
+}
+
+function readUint31(buf, offset) {
+    return ((buf[offset] & 0x7f) * 0x1000000) + (buf[offset + 1] << 16) + (buf[offset + 2] << 8) + buf[offset + 3];
+}
+
+function readUint32(buf, offset) {
+    return (buf[offset] * 0x1000000) + (buf[offset + 1] << 16) + (buf[offset + 2] << 8) + buf[offset + 3];
 }
 
 async function sendWindowUpdate(writer, streamId, increment) {
