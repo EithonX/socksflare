@@ -24,6 +24,7 @@ const ATYP_IPV4 = 0x01;
 const ATYP_DOMAIN = 0x03;
 const ATYP_IPV6 = 0x04;
 const REP_SUCCESS = 0x00;
+const MAX_CONSECUTIVE_EMPTY_CHUNKS = 1024;
 
 const REPLY_MESSAGES = {
   0x01: 'general SOCKS server failure',
@@ -47,9 +48,18 @@ class BufferedReader {
   }
 
   async readExact(n) {
+    let emptyChunkCount = 0;
     while (this.totalBytes - this.offset < n) {
       const { value, done } = await this.reader.read();
       if (done || !value) throw new Error('SOCKS5: connection closed prematurely');
+      if (value.byteLength === 0) {
+        emptyChunkCount += 1;
+        if (emptyChunkCount > MAX_CONSECUTIVE_EMPTY_CHUNKS) {
+          throw new Error('SOCKS5: too many consecutive empty chunks');
+        }
+        continue;
+      }
+      emptyChunkCount = 0;
       this.chunks.push(value);
       this.totalBytes += value.byteLength;
     }

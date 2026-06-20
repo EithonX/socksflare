@@ -70,7 +70,16 @@ export class Socks5Client {
      */
     async fetch(input, init = {}, options = {}) {
         const mergedInit = { ...init };
-        mergedInit.signal = buildMergedSignal(mergedInit.signal, options.timeoutMs);
+        const hasInitSignal = Object.prototype.hasOwnProperty.call(init, 'signal');
+        const requestSignal = input instanceof Request && !hasInitSignal ? input.signal : mergedInit.signal;
+        const mergedSignal = buildMergedSignal(requestSignal, options.timeoutMs);
+
+        if (hasInitSignal || options.timeoutMs != null) {
+            if (mergedSignal) mergedInit.signal = mergedSignal;
+            else delete mergedInit.signal;
+        } else {
+            delete mergedInit.signal;
+        }
         return proxyFetch(input, mergedInit, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
             httpVersion: options.httpVersion,
@@ -102,34 +111,84 @@ export class Socks5Client {
 }
 
 function buildMergedSignal(signal, timeoutMs) {
-    if (!timeoutMs) return signal || null;
+    if (timeoutMs == null) return signal || null;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        throw new Error(`socksflare: timeoutMs must be a finite number > 0; got ${timeoutMs}`);
+    }
 
     let timeoutSignal;
+    let disposeTimeout = null;
     if (typeof AbortSignal.timeout === 'function') {
         timeoutSignal = AbortSignal.timeout(timeoutMs);
     } else {
         const ac = new AbortController();
-        setTimeout(() => {
+        const timer = setTimeout(() => {
             const err = typeof DOMException === 'function'
                 ? new DOMException('Timeout', 'TimeoutError')
                 : Object.assign(new Error('Timeout'), { name: 'TimeoutError' });
             ac.abort(err);
         }, timeoutMs);
+        disposeTimeout = () => clearTimeout(timer);
         timeoutSignal = ac.signal;
     }
 
     if (signal && typeof AbortSignal.any === 'function') {
-        return AbortSignal.any([signal, timeoutSignal]);
+        const merged = AbortSignal.any([signal, timeoutSignal]);
+        if (disposeTimeout) {
+            const cleanup = () => {
+                disposeTimeout();
+                disposeTimeout = null;
+                merged.removeEventListener('abort', cleanup);
+            };
+            merged.addEventListener('abort', cleanup, { once: true });
+        }
+        return merged;
     }
 
     if (signal) {
         const ac = new AbortController();
-        const forward = s => { if (!ac.signal.aborted) ac.abort(s.reason); };
-        signal.addEventListener('abort', () => forward(signal), { once: true });
-        timeoutSignal.addEventListener('abort', () => forward(timeoutSignal), { once: true });
+        let sourceAbortHandler = null;
+        let timeoutAbortHandler = null;
+        const cleanup = () => {
+            if (sourceAbortHandler) signal.removeEventListener('abort', sourceAbortHandler);
+            if (timeoutAbortHandler) timeoutSignal.removeEventListener('abort', timeoutAbortHandler);
+            if (disposeTimeout) {
+                disposeTimeout();
+                disposeTimeout = null;
+            }
+            sourceAbortHandler = null;
+            timeoutAbortHandler = null;
+        };
+        if (signal.aborted) {
+            cleanup();
+            ac.abort(signal.reason);
+            return ac.signal;
+        }
+        if (timeoutSignal.aborted) {
+            cleanup();
+            ac.abort(timeoutSignal.reason);
+            return ac.signal;
+        }
+        const forward = s => {
+            if (ac.signal.aborted) return;
+            cleanup();
+            ac.abort(s.reason);
+        };
+        sourceAbortHandler = () => forward(signal);
+        timeoutAbortHandler = () => forward(timeoutSignal);
+        signal.addEventListener('abort', sourceAbortHandler, { once: true });
+        timeoutSignal.addEventListener('abort', timeoutAbortHandler, { once: true });
         return ac.signal;
     }
 
+    if (disposeTimeout) {
+        const cleanup = () => {
+            disposeTimeout();
+            disposeTimeout = null;
+            timeoutSignal.removeEventListener('abort', cleanup);
+        };
+        timeoutSignal.addEventListener('abort', cleanup, { once: true });
+    }
     return timeoutSignal;
 }
 

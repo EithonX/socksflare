@@ -39,6 +39,7 @@ const DEFAULT_HEADER_TABLE_SIZE = 4096;
 const MAX_WINDOW_SIZE = 0x7fffffff;            // RFC 9113 §6.9.1: 2^31-1
 const MAX_STREAM_ID = 0x7ffffffe;              // RFC 9113: max client stream ID (odd, < 2^31)
 const MAX_HEADER_LIST_SIZE = 65536;
+const MAX_CONSECUTIVE_EMPTY_CHUNKS = 1024;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
@@ -183,6 +184,7 @@ class Http2SingleConnection {
         this.frameWriter = tunnel.writable.getWriter();
         this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
         this.windowTracker = new WindowTracker();
+        this.localInboundMaxFrameSize = DEFAULT_MAX_FRAME_SIZE;
         this.streams = new Map();
         this.settingsAckPending = false;
         this.closed = false;
@@ -300,7 +302,7 @@ class Http2SingleConnection {
         try {
             while (!this.closed) {
                 throwIfAborted(this.signal);
-                const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
+                const frame = await this.frameReader.readFrame(this.localInboundMaxFrameSize);
                 await this.handleFrame(frame);
             }
         } catch (err) {
@@ -391,9 +393,9 @@ class Http2SingleConnection {
                 this.failStream(stream, new Error('HTTP/2 response body exceeded Content-Length'));
                 return;
             }
+            await stream.bodyWriter.write(parsed.data);
             await sendWindowUpdate(this.frameWriter, 0, parsed.data.byteLength);
             await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.data.byteLength);
-            await stream.bodyWriter.write(parsed.data);
         }
         if (parsed.endStream) this.finishStream(stream);
     }
@@ -418,7 +420,7 @@ class Http2SingleConnection {
                 if (id === SETTINGS_ENABLE_PUSH && val !== 0 && val !== 1) {
                     throw new Error('HTTP/2: invalid SETTINGS_ENABLE_PUSH');
                 } else if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
-                else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
+                else if (id === 0x5) this.windowTracker.updatePeerMaxFrameSize(val);
             }
             await writeFrame(this.frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
             return;
@@ -459,7 +461,7 @@ class Http2SingleConnection {
         let isEndHeaders = parsed.endHeaders;
 
         while (!isEndHeaders) {
-            const cframe = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
+            const cframe = await this.frameReader.readFrame(this.localInboundMaxFrameSize);
             if (cframe.streamId !== frame.streamId || cframe.type !== FRAME_CONTINUATION) {
                 throw new Error('HTTP/2: invalid continuation sequence');
             }
@@ -526,11 +528,20 @@ class H2FrameReader {
     }
 
     async readExact(n) {
+        let emptyChunkCount = 0;
         while (this.totalBytes - this.offset < n) {
             const { done, value } = await this.reader.read();
             if (done || !value) {
                 throw new Error('HTTP/2: unexpected EOF');
             }
+            if (value.byteLength === 0) {
+                emptyChunkCount += 1;
+                if (emptyChunkCount > MAX_CONSECUTIVE_EMPTY_CHUNKS) {
+                    throw new Error('HTTP/2: too many consecutive empty chunks');
+                }
+                continue;
+            }
+            emptyChunkCount = 0;
             this.chunks.push(value);
             this.totalBytes += value.byteLength;
         }
@@ -570,7 +581,7 @@ class H2FrameReader {
     }
 
     // H1: Enforce frame payload size against negotiated MAX_FRAME_SIZE
-    async readFrame(peerMaxFrameSize) {
+    async readFrame(localInboundMaxFrameSize = DEFAULT_MAX_FRAME_SIZE) {
         const head = await this.readExact(9);
         const length = (head[0] << 16) | (head[1] << 8) | head[2];
         const type = head[3];
@@ -583,7 +594,7 @@ class H2FrameReader {
         }
         // Enforce negotiated MAX_FRAME_SIZE for non-exempt frame types.
         // SETTINGS, PING, GOAWAY are allowed at connection default (16384) even before negotiation.
-        const effectiveMax = peerMaxFrameSize || DEFAULT_MAX_FRAME_SIZE;
+        const effectiveMax = localInboundMaxFrameSize || DEFAULT_MAX_FRAME_SIZE;
         if (length > effectiveMax && type !== FRAME_SETTINGS && type !== FRAME_GOAWAY) {
             throw new Error(`HTTP/2: frame payload (${length}) exceeds MAX_FRAME_SIZE (${effectiveMax})`);
         }
@@ -606,15 +617,15 @@ class WindowTracker {
         this.connectionWindow = initialWindowSize;
         this.streamWindows = new Map();
         this.initialWindowSize = initialWindowSize;
-        this.maxFrameSize = maxFrameSize;
+        this.peerOutboundMaxFrameSize = maxFrameSize;
         this.waiters = [];
     }
 
-    updateMaxFrameSize(size) {
+    updatePeerMaxFrameSize(size) {
         if (size < 16384 || size > 16777215) {
             throw new Error('HTTP/2: invalid SETTINGS_MAX_FRAME_SIZE');
         }
-        this.maxFrameSize = size;
+        this.peerOutboundMaxFrameSize = size;
         this._notify();
     }
 
@@ -661,7 +672,7 @@ class WindowTracker {
         while (true) {
             throwIfAborted(signal);
             const streamWin = this.getStreamWindow(streamId);
-            const available = Math.min(this.connectionWindow, streamWin, this.maxFrameSize);
+            const available = Math.min(this.connectionWindow, streamWin, this.peerOutboundMaxFrameSize);
 
             if (available > 0) {
                 const take = Math.min(available, requestedBytes);
@@ -892,6 +903,7 @@ function validateResponseHeaders(decoded, trailers) {
             if (status !== null) throw new Error('HTTP/2: duplicate :status header');
             if (!/^[0-9]{3}$/.test(value)) throw new Error(`HTTP/2: invalid :status value: ${value}`);
             status = Number(value);
+            if (status < 100 || status > 599) throw new Error(`HTTP/2: invalid :status value: ${value}`);
             continue;
         }
 
@@ -940,20 +952,6 @@ function parseStrictContentLength(values, prefix) {
     const n = Number(first);
     if (!Number.isSafeInteger(n) || n < 0) throw new Error(`${prefix}: invalid Content-Length: ${first}`);
     return n;
-}
-
-function applyRegularHeaders(decoded, headers) {
-    for (const [name, value] of decoded) {
-        if (!name || name[0] === ':' || value == null) continue;
-        headers.append(name, value);
-    }
-}
-
-function applyTrailerHeaders(decoded, headers) {
-    for (const [name, value] of decoded) {
-        if (!name || name[0] === ':' || value == null) continue;
-        headers.append(name, value);
-    }
 }
 
 function parseHeadersPayload(payload, flags) {

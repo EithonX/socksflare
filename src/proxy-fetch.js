@@ -26,6 +26,7 @@ const MAX_RESPONSE_HEADERS = 200;            // max individual header lines
 const MAX_HEADER_LINE_LENGTH = 8192;         // 8KB per header line
 const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
 const MAX_CHUNK_LINE_LENGTH = 8192;          // 8KB chunk-size / trailer line cap
+const MAX_CONSECUTIVE_EMPTY_CHUNKS = 1024;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
@@ -53,6 +54,7 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
             method: input.method,
             headers: Object.fromEntries(input.headers.entries()),
             body: input.body,
+            signal: input.signal,
             ...init,
         };
     } else {
@@ -236,6 +238,7 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
 
     while (true) {
         // Accumulate bytes until one complete header section exists.
+        let emptyChunkCount = 0;
         while (headerEndOffset === -1) {
             throwIfAborted(signal);
             let chunk;
@@ -247,6 +250,14 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
             }
             const { value, done } = chunk;
             if (done) throw new Error('SOCKS5 proxy: connection closed before headers received');
+            if (value && value.byteLength === 0) {
+                emptyChunkCount += 1;
+                if (emptyChunkCount > MAX_CONSECUTIVE_EMPTY_CHUNKS) {
+                    throw new Error('HTTP response headers: too many consecutive empty chunks');
+                }
+                continue;
+            }
+            emptyChunkCount = 0;
 
             buffers.push(value);
             totalLen += value.byteLength;
@@ -269,6 +280,9 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
 
         status = parseInt(statusMatch[1], 10);
         statusText = statusMatch[2] || '';
+        if (status < 100 || status > 599) {
+            throw new Error(`Invalid HTTP response status: ${status}`);
+        }
 
         if (status === 101) {
             throw new Error('HTTP upgrade responses are not supported');
@@ -545,12 +559,18 @@ function createDirectStream(reader, initialData, socket, signal, cleanup) {
             return reader.read().then(({ value, done }) => {
                 if (done) {
                     cleanup();
+                    try { socket.close(); } catch (_) { /* noop */ }
                     controller.close();
+                    return;
                 }
-                else controller.enqueue(value);
-            }).catch(() => {
+                if (value && value.byteLength === 0) {
+                    return;
+                }
+                controller.enqueue(value);
+            }).catch((err) => {
                 cleanup();
-                controller.close();
+                try { socket.close(); } catch (_) { /* noop */ }
+                controller.error(signal && signal.aborted ? makeAbortError(signal) : toError(err));
             });
         },
         cancel() {

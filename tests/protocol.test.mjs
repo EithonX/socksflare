@@ -8,7 +8,8 @@ function loadSource(file, names) {
   let source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
   source = source
     .replace(/^import .*?;\r?\n/gm, '')
-    .replace(/\bexport\s+(?=(async\s+)?function|class|const|let|var)/g, '');
+    .replace(/\bexport\s+(?=(async\s+)?function|class|const|let|var)/g, '')
+    .replace(/^export\s*\{[^}]+\};?\r?\n/gm, '');
 
   return Function(`${source}\nreturn { ${names.join(', ')} };`)();
 }
@@ -18,18 +19,21 @@ const http1 = loadSource('proxy-fetch.js', [
   'parseResponseBinary',
   'createContentLengthStream',
   'createChunkedStream',
+  'createDirectStream',
   'writeHttp11Body',
   'buildHttpRequest',
 ]);
 
 const h2 = loadSource('proxy-fetch-http2.js', [
   'Http2SingleConnection',
+  'H2FrameReader',
   'HpackDecoder',
   'WindowTracker',
   'encodeLiteralHeaderNoIndex',
   'buildRequestHeaders',
   'concatChunks',
   'MAX_WINDOW_SIZE',
+  'DEFAULT_MAX_FRAME_SIZE',
   'FRAME_HEADERS',
   'FRAME_DATA',
   'FRAME_RST_STREAM',
@@ -44,6 +48,11 @@ const h2 = loadSource('proxy-fetch-http2.js', [
 
 const tls = loadSource('wasm-tls.js', [
   'advanceRustlsNetworkOffset',
+]);
+
+const indexApi = loadSource('index.js', [
+  'Socks5Client',
+  'buildMergedSignal',
 ]);
 
 function bytes(s) {
@@ -84,6 +93,26 @@ function fakeSocket() {
       this.closed = true;
       return Promise.resolve();
     },
+  };
+}
+
+function readerFromSteps(steps) {
+  const queue = steps.slice();
+  return {
+    async read() {
+      if (queue.length === 0) return { done: true, value: undefined };
+      const step = queue.shift();
+      if (step instanceof Error) throw step;
+      if (step && step.throw) throw step.throw;
+      if (step && step.done) return { done: true, value: step.value };
+      const value = step instanceof Uint8Array ? step : bytes(step ?? '');
+      return { done: false, value };
+    },
+    cancel() {
+      queue.length = 0;
+      return Promise.resolve();
+    },
+    releaseLock() {},
   };
 }
 
@@ -189,6 +218,21 @@ function h2HeaderBlock(pairs) {
   return h2.concatChunks(pairs.map(([name, value]) => h2.encodeLiteralHeaderNoIndex(name, value)));
 }
 
+function h2Frame(type, flags, streamId, payload) {
+  const out = new Uint8Array(9 + payload.byteLength);
+  out[0] = (payload.byteLength >>> 16) & 0xff;
+  out[1] = (payload.byteLength >>> 8) & 0xff;
+  out[2] = payload.byteLength & 0xff;
+  out[3] = type & 0xff;
+  out[4] = flags & 0xff;
+  out[5] = (streamId >>> 24) & 0x7f;
+  out[6] = (streamId >>> 16) & 0xff;
+  out[7] = (streamId >>> 8) & 0xff;
+  out[8] = streamId & 0xff;
+  out.set(payload, 9);
+  return out;
+}
+
 test('HTTP/1.1 Content-Length body succeeds exactly', async () => {
   const socket = fakeSocket();
   const stream = http1.createContentLengthStream(
@@ -263,6 +307,77 @@ test('proxyFetch rejects unsupported protocols before dialing', async () => {
     http1.proxyFetch('ftp://example.com/', {}, {}, {}),
     /Unsupported URL protocol: ftp:/,
   );
+});
+
+test('proxyFetch preserves Request signal and aborts before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  const ac = new AbortController();
+  ac.abort(new Error('stop'));
+  const request = new Request('http://example.com/', { signal: ac.signal });
+
+  try {
+    await assert.rejects(
+      http1.proxyFetch(request, {}, {}, {}),
+      /stop/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('Socks5Client.fetch preserves Request signal when no init signal or timeout is provided', async () => {
+  const prevProxyFetch = globalThis.proxyFetch;
+  let seenInit;
+
+  globalThis.proxyFetch = async (_input, init) => {
+    seenInit = init;
+    return new Response('ok');
+  };
+
+  try {
+    const client = new indexApi.Socks5Client({ host: '127.0.0.1' });
+    const ac = new AbortController();
+    const request = new Request('http://example.com/', { signal: ac.signal });
+
+    await client.fetch(request);
+
+    assert.equal('signal' in seenInit, false);
+  } finally {
+    globalThis.proxyFetch = prevProxyFetch;
+  }
+});
+
+test('Socks5Client.fetch merges Request signal with timeout', async () => {
+  const prevProxyFetch = globalThis.proxyFetch;
+  let seenInit;
+
+  globalThis.proxyFetch = async (_input, init) => {
+    seenInit = init;
+    return new Response('ok');
+  };
+
+  try {
+    const client = new indexApi.Socks5Client({ host: '127.0.0.1' });
+    const ac = new AbortController();
+    const request = new Request('http://example.com/', { signal: ac.signal });
+
+    await client.fetch(request, {}, { timeoutMs: 1000 });
+
+    const reason = new Error('request abort');
+    ac.abort(reason);
+
+    assert.equal(seenInit.signal.aborted, true);
+    assert.equal(seenInit.signal.reason, reason);
+  } finally {
+    globalThis.proxyFetch = prevProxyFetch;
+  }
 });
 
 test('proxyFetch auto falls back to HTTP/1.1 only when HTTP/2 ALPN negotiation fails', async () => {
@@ -521,6 +636,16 @@ test('WindowTracker waits when stream window is exactly zero', async () => {
   assert.equal(resolved, true);
 });
 
+test('WindowTracker uses peer outbound max frame size for upload chunking', async () => {
+  const tracker = new h2.WindowTracker();
+  tracker.connectionWindow = 65535;
+  tracker.streamWindows.set(1, 65535);
+  tracker.updatePeerMaxFrameSize(32768);
+
+  const take = await tracker.waitForCredits(1, 40000, null);
+  assert.equal(take, 32768);
+});
+
 test('WindowTracker addCredits when stream window is zero yields correct value', () => {
   const tracker = new h2.WindowTracker();
   tracker.streamWindows.set(1, 0);
@@ -534,6 +659,34 @@ test('WindowTracker rejects SETTINGS_INITIAL_WINDOW_SIZE overflow for existing s
   assert.throws(
     () => tracker.updateInitialWindowSize(h2.MAX_WINDOW_SIZE),
     /overflow after SETTINGS_INITIAL_WINDOW_SIZE/,
+  );
+});
+
+test('HTTP/2 rejects out-of-range :status values', async () => {
+  const { conn } = h2Conn();
+
+  const stream1 = conn.createStreamState(1);
+  conn.streams.set(1, stream1);
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_HEADERS,
+      flags: h2.FLAG_END_HEADERS,
+      streamId: 1,
+      payload: h2HeaderBlock([[':status', '099']]),
+    }),
+    /invalid :status value: 099/,
+  );
+
+  const stream2 = conn.createStreamState(3);
+  conn.streams.set(3, stream2);
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_HEADERS,
+      flags: h2.FLAG_END_HEADERS,
+      streamId: 3,
+      payload: h2HeaderBlock([[':status', '700']]),
+    }),
+    /invalid :status value: 700/,
   );
 });
 
@@ -752,6 +905,53 @@ test('HTTP/1.1 304 with Content-Length returns null body', async () => {
   assert.equal(res.body, null);
 });
 
+test('HTTP/1.1 direct stream read error rejects body', async () => {
+  const socket = fakeSocket();
+  const stream = http1.createDirectStream(
+    readerFromSteps([{ throw: new Error('boom') }]),
+    new Uint8Array(0),
+    socket,
+    null,
+    () => {},
+  );
+
+  await assert.rejects(withTimeout(readAll(stream)), /boom/);
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/1.1 parser rejects out-of-range final status codes', async () => {
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 099 Weird\r\nContent-Length: 0\r\n\r\n']),
+      fakeSocket(),
+      null,
+    ),
+    /Invalid HTTP response status: 99/,
+  );
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 700 Weird\r\nContent-Length: 0\r\n\r\n']),
+      fakeSocket(),
+      null,
+    ),
+    /Invalid HTTP response status: 700/,
+  );
+});
+
+test('HTTP/1.1 parser skips empty header chunks', async () => {
+  const readable = {
+    getReader() {
+      return readerFromSteps([
+        new Uint8Array(0),
+        new Uint8Array(0),
+        bytes('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'),
+      ]);
+    },
+  };
+  const res = await http1.parseResponseBinary(readable, fakeSocket(), null);
+  assert.equal(await res.text(), 'ok');
+});
+
 test('HTTP/2 204 without END_STREAM on HEADERS: nullBody=true and endStream=false', async () => {
   const { conn } = h2Conn();
   const stream = conn.createStreamState(1);
@@ -900,6 +1100,131 @@ test('HTTP/2 fetch returns null body for HEAD 200 without END_STREAM on HEADERS'
 
   await new Promise(r => setTimeout(r, 0));
   assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 inbound frame size does not expand from peer SETTINGS_MAX_FRAME_SIZE', async () => {
+  const { conn } = h2Conn();
+  await conn.handleControlFrame({
+    type: h2.FRAME_SETTINGS,
+    flags: 0,
+    streamId: 0,
+    payload: settingsPayload(0x5, 32768),
+  });
+  assert.equal(conn.windowTracker.peerOutboundMaxFrameSize, 32768);
+
+  const reader = new h2.H2FrameReader(readerFromSteps([
+    h2Frame(h2.FRAME_DATA, 0, 1, new Uint8Array(h2.DEFAULT_MAX_FRAME_SIZE + 1)),
+  ]));
+  await assert.rejects(
+    reader.readFrame(h2.DEFAULT_MAX_FRAME_SIZE),
+    new RegExp(`exceeds MAX_FRAME_SIZE \\(${h2.DEFAULT_MAX_FRAME_SIZE}\\)`),
+  );
+});
+
+test('HTTP/2 frame reader skips empty chunks before valid frame', async () => {
+  const frameBytes = h2Frame(h2.FRAME_DATA, h2.FLAG_END_STREAM, 1, bytes('ok'));
+  const reader = new h2.H2FrameReader(readerFromSteps([
+    new Uint8Array(0),
+    new Uint8Array(0),
+    frameBytes.subarray(0, 5),
+    frameBytes.subarray(5),
+  ]));
+
+  const frame = await reader.readFrame(h2.DEFAULT_MAX_FRAME_SIZE);
+  assert.equal(frame.streamId, 1);
+  assert.equal(new TextDecoder().decode(frame.payload), 'ok');
+});
+
+test('SOCKS BufferedReader skips empty chunks before exact read', async () => {
+  const socks = loadSource('socks5-client.js', ['BufferedReader']);
+  const reader = new socks.BufferedReader(readerFromSteps([
+    new Uint8Array(0),
+    new Uint8Array(0),
+    bytes('he'),
+    bytes('llo'),
+  ]));
+
+  const out = await reader.readExact(5);
+  assert.equal(new TextDecoder().decode(out), 'hello');
+});
+
+test('buildMergedSignal validates timeoutMs', () => {
+  assert.throws(() => indexApi.buildMergedSignal(null, -1), /timeoutMs must be a finite number > 0/);
+  assert.throws(() => indexApi.buildMergedSignal(null, NaN), /timeoutMs must be a finite number > 0/);
+  assert.throws(() => indexApi.buildMergedSignal(null, Infinity), /timeoutMs must be a finite number > 0/);
+});
+
+test('buildMergedSignal fallback propagates source abort', () => {
+  const prevTimeout = AbortSignal.timeout;
+  const prevAny = AbortSignal.any;
+  AbortSignal.timeout = undefined;
+  AbortSignal.any = undefined;
+
+  try {
+    const ac = new AbortController();
+    const merged = indexApi.buildMergedSignal(ac.signal, 1000);
+    const reason = new Error('user abort');
+    ac.abort(reason);
+    assert.equal(merged.aborted, true);
+    assert.equal(merged.reason, reason);
+  } finally {
+    AbortSignal.timeout = prevTimeout;
+    AbortSignal.any = prevAny;
+  }
+});
+
+test('buildMergedSignal fallback preserves already-aborted source signal', () => {
+  const prevTimeout = AbortSignal.timeout;
+  const prevAny = AbortSignal.any;
+  AbortSignal.timeout = undefined;
+  AbortSignal.any = undefined;
+
+  try {
+    const ac = new AbortController();
+    const reason = new Error('already aborted');
+    ac.abort(reason);
+
+    const merged = indexApi.buildMergedSignal(ac.signal, 1000);
+    assert.equal(merged.aborted, true);
+    assert.equal(merged.reason, reason);
+  } finally {
+    AbortSignal.timeout = prevTimeout;
+    AbortSignal.any = prevAny;
+  }
+});
+
+test('HTTP/2 sends WINDOW_UPDATE after body writer resolves', async () => {
+  const { conn, writes } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+  stream.headerSeen = true;
+  stream.headers.resolve({ meta: {}, endStream: false });
+
+  let releaseWrite;
+  const bodyWriteStarted = new Promise(resolve => {
+    stream.bodyWriter = {
+      write() {
+        resolve();
+        return new Promise(r => { releaseWrite = r; });
+      },
+      close() {},
+      abort() {},
+    };
+  });
+
+  const framePromise = conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: bytes('ok'),
+  });
+
+  await bodyWriteStarted;
+  assert.equal(writes.some(frame => frame[3] === h2.FRAME_WINDOW_UPDATE), false);
+  releaseWrite();
+  await framePromise;
+  assert.equal(writes.some(frame => frame[3] === h2.FRAME_WINDOW_UPDATE), true);
 });
 
 test('wasmTls rejects zero-byte Rustls consumption from non-empty network chunk', () => {
