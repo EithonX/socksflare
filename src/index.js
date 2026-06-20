@@ -70,17 +70,7 @@ export class Socks5Client {
      */
     async fetch(input, init = {}, options = {}) {
         const mergedInit = { ...init };
-
-        // H5: Merge user signal with optional timeout
-        if (options.timeoutMs && typeof AbortSignal.timeout === 'function') {
-            const timeoutSignal = AbortSignal.timeout(options.timeoutMs);
-            if (mergedInit.signal && typeof AbortSignal.any === 'function') {
-                mergedInit.signal = AbortSignal.any([mergedInit.signal, timeoutSignal]);
-            } else {
-                mergedInit.signal = timeoutSignal;
-            }
-        }
-
+        mergedInit.signal = buildMergedSignal(mergedInit.signal, options.timeoutMs);
         return proxyFetch(input, mergedInit, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
             httpVersion: options.httpVersion,
@@ -106,8 +96,41 @@ export class Socks5Client {
             enableTls: options.enableTls || false,
             tlsHostname: options.tlsHostname || targetHost,
             alpnProtocols: options.alpnProtocols,
+            signal: buildMergedSignal(options.signal, options.timeoutMs),
         });
     }
+}
+
+function buildMergedSignal(signal, timeoutMs) {
+    if (!timeoutMs) return signal || null;
+
+    let timeoutSignal;
+    if (typeof AbortSignal.timeout === 'function') {
+        timeoutSignal = AbortSignal.timeout(timeoutMs);
+    } else {
+        const ac = new AbortController();
+        setTimeout(() => {
+            const err = typeof DOMException === 'function'
+                ? new DOMException('Timeout', 'TimeoutError')
+                : Object.assign(new Error('Timeout'), { name: 'TimeoutError' });
+            ac.abort(err);
+        }, timeoutMs);
+        timeoutSignal = ac.signal;
+    }
+
+    if (signal && typeof AbortSignal.any === 'function') {
+        return AbortSignal.any([signal, timeoutSignal]);
+    }
+
+    if (signal) {
+        const ac = new AbortController();
+        const forward = s => { if (!ac.signal.aborted) ac.abort(s.reason); };
+        signal.addEventListener('abort', () => forward(signal), { once: true });
+        timeoutSignal.addEventListener('abort', () => forward(timeoutSignal), { once: true });
+        return ac.signal;
+    }
+
+    return timeoutSignal;
 }
 
 // Re-export low-level functions for advanced usage

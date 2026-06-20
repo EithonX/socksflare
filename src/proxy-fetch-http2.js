@@ -194,6 +194,7 @@ class Http2SingleConnection {
             [SETTINGS_HEADER_TABLE_SIZE, ADVERTISED_HEADER_TABLE_SIZE],
             [SETTINGS_ENABLE_PUSH, 0],
         ]));
+        this.hpackDecoder.setSettingsMaxDynamicSize(ADVERTISED_HEADER_TABLE_SIZE);
         this.settingsAckPending = true;
         this.readLoopPromise = this.readLoop();
     }
@@ -201,12 +202,17 @@ class Http2SingleConnection {
     async fetch(url, requestInit) {
         throwIfAborted(requestInit.signal);
 
+        const method = (requestInit.method || 'GET').toUpperCase();
+        if (!/^[A-Z]+$/.test(method)) {
+            throw new Error(`HTTP/2: invalid method: ${method}`);
+        }
+
         const streamId = 1;
         const stream = this.createStreamState(streamId);
+        stream.method = method;
         this.streams.set(streamId, stream);
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
 
-        const method = (requestInit.method || 'GET').toUpperCase();
         const bodyMode = await normalizeRequestBody(requestInit.body);
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
@@ -220,7 +226,17 @@ class Http2SingleConnection {
         uploadPromise.catch(err => this.failStream(stream, toError(err)));
 
         const { meta, endStream } = await stream.headers.promise;
-        if (endStream || [204, 205, 304].includes(meta.status)) {
+
+        if (isNullBodyResponse(method, meta.status)) {
+            if (endStream) {
+                this.finishStream(stream);
+            } else {
+                this.cancelStream(stream, new Error('HTTP/2 null-body response closed after headers')).catch(() => {});
+            }
+            return new Response(null, { status: meta.status, headers: meta.headers });
+        }
+
+        if (endStream) {
             this.finishStream(stream);
             return new Response(null, { status: meta.status, headers: meta.headers });
         }
@@ -232,10 +248,12 @@ class Http2SingleConnection {
         const body = new TransformStream();
         const stream = {
             streamId,
+            method: 'GET',
             headers: createDeferred(),
             headerSeen: false,
             contentLength: null,
             receivedBytes: 0,
+            nullBody: false,
             bodyReadable: null,
             bodyWriter: body.writable.getWriter(),
             bodyReader: body.readable.getReader(),
@@ -339,7 +357,8 @@ class Http2SingleConnection {
                 }
                 stream.headerSeen = true;
                 stream.contentLength = meta.contentLength;
-                if (endStream && stream.contentLength !== null && stream.contentLength !== 0) {
+                stream.nullBody = isNullBodyResponse(stream.method, meta.status);
+                if (endStream && !stream.nullBody && stream.contentLength !== null && stream.contentLength !== 0) {
                     this.failStream(stream, new Error('HTTP/2 response body truncated'));
                     return;
                 }
@@ -354,6 +373,14 @@ class Http2SingleConnection {
             throw new Error('HTTP/2: DATA before response HEADERS');
         }
         const parsed = parseDataPayload(frame.payload, frame.flags);
+        if (stream.nullBody) {
+            if (parsed.data.byteLength > 0) {
+                this.failStream(stream, new Error('HTTP/2: DATA frame on null-body response'));
+                return;
+            }
+            if (parsed.endStream) this.finishStream(stream);
+            return;
+        }
         if (parsed.data.byteLength > 0) {
             stream.receivedBytes += parsed.data.byteLength;
             if (stream.contentLength !== null && stream.receivedBytes > stream.contentLength) {
@@ -375,7 +402,6 @@ class Http2SingleConnection {
                 }
                 if (this.settingsAckPending) {
                     this.settingsAckPending = false;
-                    this.hpackDecoder.setSettingsMaxDynamicSize(ADVERTISED_HEADER_TABLE_SIZE);
                 }
                 return;
             }
@@ -447,7 +473,7 @@ class Http2SingleConnection {
 
     finishStream(stream) {
         if (stream.done) return;
-        if (stream.contentLength !== null && stream.receivedBytes !== stream.contentLength) {
+        if (!stream.nullBody && stream.contentLength !== null && stream.receivedBytes !== stream.contentLength) {
             this.failStream(stream, new Error(
                 `HTTP/2 response body truncated: expected ${stream.contentLength}, received ${stream.receivedBytes}`
             ));
@@ -467,6 +493,9 @@ class Http2SingleConnection {
         try { stream.bodyWriter.abort(err); } catch (_) { /* noop */ }
         this.streams.delete(stream.streamId);
         this.windowTracker.streamWindows.delete(stream.streamId);
+        if (this.streams.size === 0 && !this.closed) {
+            this.close(err);
+        }
     }
 
     close(reason = null) {
@@ -597,7 +626,12 @@ class WindowTracker {
         this._notify();
     }
 
-    // H3: RFC 9113 §6.9.1 — window MUST NOT exceed 2^31-1
+    getStreamWindow(streamId) {
+        return this.streamWindows.has(streamId)
+            ? this.streamWindows.get(streamId)
+            : this.initialWindowSize;
+    }
+
     addCredits(streamId, increment) {
         if (streamId === 0) {
             this.connectionWindow += increment;
@@ -605,7 +639,7 @@ class WindowTracker {
                 throw new Error('HTTP/2: connection flow-control window overflow (FLOW_CONTROL_ERROR)');
             }
         } else {
-            const current = this.streamWindows.get(streamId) || this.initialWindowSize;
+            const current = this.getStreamWindow(streamId);
             const newVal = current + increment;
             if (newVal > MAX_WINDOW_SIZE) {
                 throw new Error('HTTP/2: stream flow-control window overflow (FLOW_CONTROL_ERROR)');
@@ -618,7 +652,7 @@ class WindowTracker {
     async waitForCredits(streamId, requestedBytes, signal) {
         while (true) {
             throwIfAborted(signal);
-            const streamWin = this.streamWindows.get(streamId) || this.initialWindowSize;
+            const streamWin = this.getStreamWindow(streamId);
             const available = Math.min(this.connectionWindow, streamWin, this.maxFrameSize);
 
             if (available > 0) {
@@ -828,6 +862,10 @@ function getStatusFromDecoded(decoded) {
     return 0;
 }
 
+function isNullBodyResponse(method, status) {
+    return method === 'HEAD' || status === 204 || status === 205 || status === 304;
+}
+
 function validateResponseHeaders(decoded, trailers) {
     const headers = new Headers();
     const contentLengthValues = [];
@@ -1014,8 +1052,12 @@ function buildRequestHeaders(url, requestInit, method, bodyMode) {
         headers.set('accept', '*/*');
     }
 
-    if (bodyMode.kind === 'bytes' && !headers.has('content-length')) {
+    if (bodyMode.kind === 'bytes') {
         headers.set('content-length', String(bodyMode.bytes.byteLength));
+    } else if (bodyMode.kind === 'stream') {
+        headers.delete('content-length');
+    } else {
+        headers.delete('content-length');
     }
 
     const dropHeaders = new Set([
@@ -1050,7 +1092,9 @@ function buildRequestHeaders(url, requestInit, method, bodyMode) {
         ) {
             continue;
         }
-        const value = String(rawValue).replace(/[\r\n]/g, '');
+        if (!HEADER_NAME_RE.test(name)) throw new Error(`HTTP/2: invalid request header name: ${name}`);
+        const value = String(rawValue);
+        if (/[\r\n]/.test(value)) throw new Error(`HTTP/2: invalid request header value for ${name}`);
         out.push([name, value]);
     }
 

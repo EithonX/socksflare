@@ -19,12 +19,15 @@ const http1 = loadSource('proxy-fetch.js', [
   'createContentLengthStream',
   'createChunkedStream',
   'writeHttp11Body',
+  'buildHttpRequest',
 ]);
 
 const h2 = loadSource('proxy-fetch-http2.js', [
   'Http2SingleConnection',
   'HpackDecoder',
+  'WindowTracker',
   'encodeLiteralHeaderNoIndex',
+  'buildRequestHeaders',
   'concatChunks',
   'FRAME_HEADERS',
   'FRAME_DATA',
@@ -403,4 +406,387 @@ test('HTTP/2 WINDOW_UPDATE after stream closed is ignored', () => {
   const { conn } = h2Conn();
   conn.handleWindowUpdate({ streamId: 1, payload: u32(1) });
   assert.equal(conn.windowTracker.streamWindows.has(1), false);
+});
+
+test('WindowTracker waits when stream window is exactly zero', async () => {
+  const tracker = new h2.WindowTracker();
+  tracker.connectionWindow = 65535;
+  tracker.streamWindows.set(1, 0);
+
+  const ac = new AbortController();
+  let resolved = false;
+
+  const p = tracker.waitForCredits(1, 1, ac.signal).then(() => {
+    resolved = true;
+  });
+
+  await new Promise(r => setTimeout(r, 20));
+  assert.equal(resolved, false);
+
+  tracker.addCredits(1, 1);
+  await p;
+  assert.equal(resolved, true);
+});
+
+test('WindowTracker addCredits when stream window is zero yields correct value', () => {
+  const tracker = new h2.WindowTracker();
+  tracker.streamWindows.set(1, 0);
+  tracker.addCredits(1, 10);
+  assert.equal(tracker.streamWindows.get(1), 10);
+});
+
+test('HTTP/2 304 with content-length and END_STREAM returns null body without error', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'GET';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '304'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 304);
+  assert.equal(endStream, true);
+  assert.equal(conn.streams.has(1), false);
+});
+
+test('HTTP/2 204 with content-length and END_STREAM returns null body without error', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'GET';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '204'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 204);
+  assert.equal(endStream, true);
+  assert.equal(conn.streams.has(1), false);
+});
+
+test('HTTP/2 HEAD response with content-length and END_STREAM returns null body without error', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'HEAD';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 200);
+  assert.equal(endStream, true);
+  assert.equal(conn.streams.has(1), false);
+});
+
+test('HTTP/2 null-body response that sends non-empty DATA rejects', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'GET';
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '304'], ['content-length', '5']]),
+  });
+  await stream.headers.promise;
+
+  const readPromise = stream.bodyReadable.getReader().read();
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: 0,
+    streamId: 1,
+    payload: bytes('hello'),
+  });
+
+  await assert.rejects(withTimeout(readPromise), /DATA frame on null-body response/);
+});
+
+test('HTTP/2 body exceeds Content-Length closes socket', async () => {
+  const { conn, socket } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+  stream.headerSeen = true;
+  stream.headers.resolve({ meta: {}, endStream: false });
+  stream.contentLength = 1;
+
+  const readPromise = stream.bodyReadable.getReader().read();
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: bytes('no'),
+  });
+
+  await assert.rejects(withTimeout(readPromise), /exceeded Content-Length/);
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 RST_STREAM closes socket', async () => {
+  const { conn, socket } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  stream.headerSeen = true;
+  stream.headers.resolve({ meta: {}, endStream: false });
+
+  const readPromise = stream.bodyReadable.getReader().read();
+  await conn.handleFrame({
+    type: h2.FRAME_RST_STREAM,
+    flags: 0,
+    streamId: 1,
+    payload: u32(0),
+  });
+
+  await assert.rejects(withTimeout(readPromise), /stream reset by peer/);
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 truncated body through finishStream closes socket', async () => {
+  const { conn, socket } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  stream.headerSeen = true;
+  stream.headers.resolve({ meta: {}, endStream: false });
+  stream.contentLength = 100;
+  stream.receivedBytes = 50;
+
+  const readPromise = stream.bodyReadable.getReader().read();
+  conn.finishStream(stream);
+
+  await assert.rejects(withTimeout(readPromise), /expected 100, received 50/);
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 HPACK dynamic table enforced immediately before SETTINGS ACK', () => {
+  const decoder = new h2.HpackDecoder(4096);
+  decoder.setSettingsMaxDynamicSize(0);
+  assert.throws(
+    () => decoder.decode(Uint8Array.of(0x3f, 0x01)),
+    /dynamic table size update.*exceeds SETTINGS limit/,
+  );
+});
+
+test('HTTP/2 byte body content-length overwrites user-supplied value', () => {
+  const fakeUrl = new URL('https://example.com/');
+  const bodyMode = { kind: 'bytes', bytes: new Uint8Array(7) };
+  const headers = h2.buildRequestHeaders(fakeUrl, { headers: { 'content-length': '999' } }, 'POST', bodyMode);
+  const cl = headers.find(([n]) => n === 'content-length');
+  assert.ok(cl, 'content-length header should be present');
+  assert.equal(cl[1], '7');
+});
+
+test('HTTP/2 stream body removes user-supplied content-length', () => {
+  const fakeUrl = new URL('https://example.com/');
+  const bodyMode = { kind: 'stream', stream: new ReadableStream() };
+  const headers = h2.buildRequestHeaders(fakeUrl, { headers: { 'content-length': '999' } }, 'POST', bodyMode);
+  const cl = headers.find(([n]) => n === 'content-length');
+  assert.equal(cl, undefined);
+});
+
+test('HTTP/2 invalid method rejects', async () => {
+  const { conn } = h2Conn();
+  await conn.init();
+  await assert.rejects(
+    conn.fetch(new URL('https://example.com/'), { method: 'get bad' }),
+    /invalid method/,
+  );
+});
+
+test('HTTP/2 invalid request header name rejects', () => {
+  const fakeUrl = new URL('https://example.com/');
+  const bodyMode = { kind: 'none' };
+  assert.throws(
+    () => h2.buildRequestHeaders(fakeUrl, { headers: { 'bad header!': 'value' } }, 'GET', bodyMode),
+    /invalid header name/,
+  );
+});
+
+test('HTTP/2 request header value with CR/LF rejects', () => {
+  const fakeUrl = new URL('https://example.com/');
+  const bodyMode = { kind: 'none' };
+  assert.throws(
+    () => h2.buildRequestHeaders(fakeUrl, { headers: { 'x-test': 'val\r\ninjected' } }, 'GET', bodyMode),
+    /invalid header value/,
+  );
+});
+
+test('HTTP/1.1 HEAD 200 with Content-Length returns null body without truncation error', async () => {
+  const readable = streamFromChunks(['HTTP/1.1 200 OK\r\nContent-Length: 123\r\n\r\n']);
+  const res = await http1.parseResponseBinary(readable, fakeSocket(), null, 'HEAD');
+  assert.equal(res.status, 200);
+  assert.equal(res.body, null);
+});
+
+test('HTTP/1.1 304 with Content-Length returns null body', async () => {
+  const readable = streamFromChunks(['HTTP/1.1 304 Not Modified\r\nContent-Length: 123\r\n\r\n']);
+  const res = await http1.parseResponseBinary(readable, fakeSocket(), null, 'GET');
+  assert.equal(res.status, 304);
+  assert.equal(res.body, null);
+});
+
+test('HTTP/2 204 without END_STREAM on HEADERS: nullBody=true and endStream=false', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'GET';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '204'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 204);
+  assert.equal(endStream, false);
+  assert.equal(stream.nullBody, true);
+  assert.doesNotThrow(() => new Response(null, { status: 204, headers: meta.headers }));
+});
+
+test('HTTP/2 304 without END_STREAM on HEADERS: nullBody=true and endStream=false', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'GET';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '304'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 304);
+  assert.equal(endStream, false);
+  assert.equal(stream.nullBody, true);
+  assert.doesNotThrow(() => new Response(null, { status: 304, headers: meta.headers }));
+});
+
+test('HTTP/2 HEAD 200 without END_STREAM on HEADERS: nullBody=true and endStream=false', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'HEAD';
+  conn.streams.set(1, stream);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200'], ['content-length', '123']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 200);
+  assert.equal(endStream, false);
+  assert.equal(stream.nullBody, true);
+});
+
+test('HTTP/1.1 invalid request header name rejects', () => {
+  assert.throws(
+    () => http1.buildHttpRequest(
+      new URL('http://example.com/'),
+      { headers: { 'bad header!': 'value' } },
+      { kind: 'none' },
+    ),
+    /invalid header name/,
+  );
+});
+
+test('HTTP/1.1 request header value with CR/LF rejects', () => {
+  assert.throws(
+    () => http1.buildHttpRequest(
+      new URL('http://example.com/'),
+      { headers: { 'x-test': 'val\r\ninjected' } },
+      { kind: 'none' },
+    ),
+    /invalid header value/,
+  );
+});
+
+test('HTTP/2 fetch returns null body for 204 without END_STREAM on HEADERS', async () => {
+  const { conn, socket } = h2Conn();
+
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '204'], ['content-length', '123']]),
+  });
+
+  const res = await withTimeout(fetchPromise);
+  assert.equal(res.status, 204);
+  assert.equal(res.body, null);
+
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 fetch returns null body for 304 without END_STREAM on HEADERS', async () => {
+  const { conn, socket } = h2Conn();
+
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '304'], ['content-length', '123']]),
+  });
+
+  const res = await withTimeout(fetchPromise);
+  assert.equal(res.status, 304);
+  assert.equal(res.body, null);
+
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 fetch returns null body for HEAD 200 without END_STREAM on HEADERS', async () => {
+  const { conn, socket } = h2Conn();
+
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'HEAD' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200'], ['content-length', '123']]),
+  });
+
+  const res = await withTimeout(fetchPromise);
+  assert.equal(res.status, 200);
+  assert.equal(res.body, null);
+
+  await new Promise(r => setTimeout(r, 0));
+  assert.equal(socket.closed, true);
 });

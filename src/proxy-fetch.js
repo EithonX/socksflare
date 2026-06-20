@@ -93,6 +93,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     let abortHandler = null;
 
     throwIfAborted(signal);
+    const method = (requestInit.method || 'GET').toUpperCase();
     const bodyMode = await normalizeHttp11Body(requestInit.body);
 
     // Establish SOCKS5 tunnel (with WASM TLS if HTTPS)
@@ -127,7 +128,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
 
         // Parse response — binary header scanning, then stream body
         if (signal) signal.removeEventListener('abort', abortHandler);
-        return await parseResponseBinary(tunnel.readable, tunnel.socket, signal);
+        return await parseResponseBinary(tunnel.readable, tunnel.socket, signal, method);
 
     } catch (err) {
         if (signal) signal.removeEventListener('abort', abortHandler);
@@ -195,7 +196,9 @@ function buildHttpRequest(url, init, bodyMode) {
 
     let str = `${method} ${path} HTTP/1.1\r\n`;
     for (const [key, value] of headers.entries()) {
-        str += `${key}: ${value.replace(/[\r\n]/g, '')}\r\n`;
+        if (!HEADER_NAME_RE.test(key)) throw new Error(`Invalid request header name: ${key}`);
+        if (!HEADER_VALUE_RE.test(value)) throw new Error(`Invalid request header value for ${key}`);
+        str += `${key}: ${value}\r\n`;
     }
     str += '\r\n';
 
@@ -204,7 +207,7 @@ function buildHttpRequest(url, init, bodyMode) {
 
 // ─── Binary HTTP Response Parser ────────────────────────────────────
 
-async function parseResponseBinary(readable, socket, signal) {
+async function parseResponseBinary(readable, socket, signal, method = 'GET') {
     const reader = readable.getReader();
     const decoder = new TextDecoder();
     let abortHandler = null;
@@ -313,9 +316,8 @@ async function parseResponseBinary(readable, socket, signal) {
         }
     }
 
-    // ── Handle null-body statuses ──
-    const nullBodyStatuses = [101, 204, 205, 304];
-    if (nullBodyStatuses.includes(status)) {
+    const nullBody = method === 'HEAD' || [204, 205, 304].includes(status);
+    if (nullBody) {
         cleanupAbort();
         reader.cancel().catch(() => { });
         try { socket.close(); } catch (_) { /* noop */ }

@@ -118,7 +118,7 @@ await writer.write(new TextEncoder().encode('EHLO example.com\r\n'));
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `options.enableTls` | `boolean` | `false` | Upgrade tunnel with TLS 1.3 |
+| `options.enableTls` | `boolean` | `false` | Upgrade tunnel with TLS via Rustls WASM |
 | `options.tlsHostname` | `string` | `targetHost` | SNI hostname |
 | `options.alpnProtocols` | `string[]` | — | Optional ALPN protocols (for example `['h2', 'http/1.1']`) |
 
