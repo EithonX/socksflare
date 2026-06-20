@@ -27,6 +27,7 @@ let wasmInitialized = false;
  * @param {string} tlsHostname - SNI hostname for the TLS handshake.
  * @param {Object} [options] - TLS handshake options.
  * @param {string[]} [options.alpnProtocols] - ALPN protocol list in preference order.
+ * @param {AbortSignal} [options.signal] - Abort signal for handshake/tunnel teardown.
  * @returns {Promise<{readable: ReadableStream, writable: WritableStream, alpnProtocol: string|null}>}
  *   Application-layer streams carrying decrypted data.
  */
@@ -37,6 +38,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
     }
 
     const toError = (err) => err instanceof Error ? err : new Error(String(err));
+    const signal = options.signal;
     const alpnProtocols = Array.isArray(options.alpnProtocols)
         ? options.alpnProtocols.map(p => String(p).trim()).filter(Boolean)
         : [];
@@ -47,6 +49,17 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
     }
 
     const client = new WasmTlsClient(tlsHostname, alpnCsv || undefined);
+    const abortError = () => {
+        if (signal && signal.reason instanceof Error) return signal.reason;
+        if (typeof DOMException === 'function') return new DOMException('Aborted', 'AbortError');
+        const err = new Error('Aborted');
+        err.name = 'AbortError';
+        return err;
+    };
+    if (signal && signal.aborted) {
+        client.free();
+        throw abortError();
+    }
 
     // Application-layer readable stream (decrypted data for the caller)
     let appReadableController = null;
@@ -58,12 +71,61 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
 
     const networkReader = networkReadable.getReader();
     const networkWriter = networkWritable.getWriter();
+    let settled = false;
+    let closed = false;
+    let freed = false;
+    let locksReleased = false;
+    let resolveHandshake;
+    let rejectHandshake;
+
+    function freeOnce() {
+        if (freed) return;
+        freed = true;
+        try { client.free(); } catch (_) { /* noop */ }
+    }
+
+    function releaseLocksOnce() {
+        if (locksReleased) return;
+        locksReleased = true;
+        try { networkReader.releaseLock(); } catch (_) { /* noop */ }
+        try { networkWriter.releaseLock(); } catch (_) { /* noop */ }
+    }
+
+    function settleReject(err) {
+        if (settled) return;
+        settled = true;
+        rejectHandshake(toError(err));
+    }
+
+    function settleResolve(value) {
+        if (settled) return;
+        settled = true;
+        resolveHandshake(value);
+    }
+
+    function teardown(err, { readableError = true } = {}) {
+        if (closed) return;
+        closed = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (!settled && err) settleReject(err);
+        if (settled && err && readableError && appReadableController) {
+            try { appReadableController.error(toError(err)); } catch (_) { /* noop */ }
+        }
+        try { networkReader.cancel(err).catch(() => { }); } catch (_) { /* noop */ }
+        try { networkWriter.abort(err).catch(() => { }); } catch (_) { /* noop */ }
+        freeOnce();
+        releaseLocksOnce();
+    }
+
+    function onAbort() {
+        teardown(abortError());
+    }
 
     /**
      * Flushes all pending TLS records from Rustls to the network socket.
      */
     async function flushNetworkWrites() {
-        while (client.wants_write()) {
+        while (!closed && client.wants_write()) {
             const netData = client.extract_network_data();
             if (netData && netData.length > 0) {
                 await networkWriter.write(netData);
@@ -75,24 +137,34 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
     const appWritable = new WritableStream({
         async write(chunk, controller) {
             try {
+                if (closed) throw new Error('wasmTls: tunnel is closed');
                 client.write_app_data(chunk);
                 await flushNetworkWrites();
             } catch (err) {
-                controller.error(toError(err));
+                const e = toError(err);
+                controller.error(e);
+                teardown(e);
             }
         },
         close() {
-            client.free();
-            try { networkWriter.close(); } catch (_) { /* noop */ }
+            const err = settled ? null : new Error('wasmTls: app writable closed before TLS handshake completed');
+            try { appReadableController.close(); } catch (_) { /* noop */ }
+            teardown(err, { readableError: false });
         }
     });
 
     return new Promise((resolve, reject) => {
-        let resolved = false;
+        resolveHandshake = resolve;
+        rejectHandshake = reject;
+        if (signal) signal.addEventListener('abort', onAbort, { once: true });
+        if (signal && signal.aborted) {
+            teardown(abortError());
+            return;
+        }
 
         // Trigger initial ClientHello
         flushNetworkWrites().catch(e => {
-            if (!resolved) { resolved = true; reject(toError(e)); }
+            teardown(toError(e));
         });
 
         /**
@@ -109,16 +181,25 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
          */
         async function networkPump() {
             try {
-                while (true) {
+                while (!closed) {
                     const { done, value } = await networkReader.read();
                     if (done) {
-                        appReadableController.close();
+                        const err = new Error('wasmTls: network closed before TLS handshake completed');
+                        if (!settled) {
+                            settleReject(err);
+                        } else {
+                            try { appReadableController.close(); } catch (_) { /* noop */ }
+                        }
+                        closed = true;
+                        if (signal) signal.removeEventListener('abort', onAbort);
+                        freeOnce();
+                        releaseLocksOnce();
                         break;
                     }
 
                     if (value && value.length > 0) {
                         let offset = 0;
-                        while (offset < value.length) {
+                        while (!closed && offset < value.length) {
                             const chunk = value.subarray(offset);
                             try {
                                 const consumed = client.provide_network_data(chunk);
@@ -129,24 +210,19 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                                 if (consumed === 0) break;
                             } catch (err) {
                                 const e = toError(err);
-                                if (!resolved) {
-                                    resolved = true;
-                                    return reject(e);
-                                } else {
-                                    appReadableController.error(e);
-                                }
+                                teardown(e);
                                 return;
                             }
 
                             await flushNetworkWrites();
+                            if (closed) return;
 
                             // Resolve on handshake completion
-                            if (!client.is_handshaking() && !resolved) {
-                                resolved = true;
+                            if (!client.is_handshaking() && !settled) {
                                 const alpnProtocol = typeof client.negotiatedAlpn === 'function'
                                     ? (client.negotiatedAlpn() || null)
                                     : null;
-                                resolve({ readable: appReadable, writable: appWritable, alpnProtocol });
+                                settleResolve({ readable: appReadable, writable: appWritable, alpnProtocol });
                             }
 
                             // Read any decrypted application data
@@ -159,17 +235,12 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                 }
             } catch (err) {
                 const e = toError(err);
-                if (!resolved) {
-                    resolved = true;
-                    reject(e);
-                } else {
-                    try { appReadableController.error(e); } catch (_) { /* noop */ }
-                }
+                teardown(e);
             }
         }
 
         networkPump().catch(e => {
-            if (!resolved) { resolved = true; reject(toError(e)); }
+            teardown(toError(e));
         });
     });
 }

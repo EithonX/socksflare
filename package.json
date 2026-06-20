@@ -10,6 +10,9 @@
   "files": [
     "src/",
     "rust-tls-wasm/pkg/",
+    "rust-tls-wasm/src/",
+    "rust-tls-wasm/Cargo.toml",
+    "rust-tls-wasm/Cargo.lock",
     "LICENSE",
     "README.md"
   ],

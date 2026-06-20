@@ -36,6 +36,5 @@ Thumbs.db
 
 # ─── Rust build artifacts (NOT pkg/ — that's committed) ─────────────
 rust-tls-wasm/target/
-rust-tls-wasm/Cargo.lock
 **/*.rs.bk
 *.pdb

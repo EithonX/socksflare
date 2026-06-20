@@ -16,8 +16,10 @@ const HTTP2_PREFACE = encoder.encode('PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n');
 
 const FRAME_DATA = 0x0;
 const FRAME_HEADERS = 0x1;
+const FRAME_PRIORITY = 0x2;
 const FRAME_RST_STREAM = 0x3;
 const FRAME_SETTINGS = 0x4;
+const FRAME_PUSH_PROMISE = 0x5;
 const FRAME_PING = 0x6;
 const FRAME_GOAWAY = 0x7;
 const FRAME_WINDOW_UPDATE = 0x8;
@@ -37,6 +39,15 @@ const DEFAULT_HEADER_TABLE_SIZE = 4096;
 const MAX_WINDOW_SIZE = 0x7fffffff;            // RFC 9113 §6.9.1: 2^31-1
 const MAX_STREAM_ID = 0x7ffffffe;              // RFC 9113: max client stream ID (odd, < 2^31)
 const MAX_HEADER_LIST_SIZE = 65536;
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
+const CONNECTION_SPECIFIC_HEADERS = new Set([
+    'connection',
+    'proxy-connection',
+    'keep-alive',
+    'upgrade',
+    'transfer-encoding',
+]);
 
 // We send SETTINGS_HEADER_TABLE_SIZE = 0, so any dynamic table size update
 // from the peer above this value is a protocol error.
@@ -151,7 +162,7 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
         throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
     }
 
-    const conn = new Http2SingleConnection(tunnel);
+    const conn = new Http2SingleConnection(tunnel, requestInit.signal);
     try {
         await conn.init();
         return await conn.fetch(url, requestInit);
@@ -162,71 +173,158 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
 }
 
 class Http2SingleConnection {
-    constructor(tunnel) {
+    constructor(tunnel, signal) {
         this.tunnel = tunnel;
+        this.signal = signal;
         this.frameReader = new H2FrameReader(tunnel.readable.getReader());
         this.frameWriter = tunnel.writable.getWriter();
         this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
         this.windowTracker = new WindowTracker();
+        this.streams = new Map();
         this.settingsAckPending = false;
         this.closed = false;
+        this.abortHandler = signal ? () => this.close(makeAbortError(signal)) : null;
     }
 
     async init() {
+        if (this.signal) this.signal.addEventListener('abort', this.abortHandler, { once: true });
+        throwIfAborted(this.signal);
         await this.frameWriter.write(HTTP2_PREFACE);
         await writeFrame(this.frameWriter, FRAME_SETTINGS, 0x00, 0, buildSettingsPayload([
             [SETTINGS_HEADER_TABLE_SIZE, ADVERTISED_HEADER_TABLE_SIZE],
             [SETTINGS_ENABLE_PUSH, 0],
         ]));
         this.settingsAckPending = true;
+        this.readLoopPromise = this.readLoop();
     }
 
     async fetch(url, requestInit) {
         throwIfAborted(requestInit.signal);
 
         const streamId = 1;
+        const stream = this.createStreamState(streamId);
+        this.streams.set(streamId, stream);
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
+
         const method = (requestInit.method || 'GET').toUpperCase();
-        const bodyMode = normalizeRequestBody(requestInit.body);
+        const bodyMode = await normalizeRequestBody(requestInit.body);
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
 
         await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
-        if (hasBody) {
-            if (bodyMode.kind === 'bytes') {
-                await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
-            } else if (bodyMode.kind === 'stream') {
-                await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
-            }
+        const uploadPromise = hasBody
+            ? (bodyMode.kind === 'bytes'
+                ? writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true, requestInit.signal)
+                : writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream, requestInit.signal))
+            : Promise.resolve();
+        uploadPromise.catch(err => this.failStream(stream, toError(err)));
+
+        const { meta, endStream } = await stream.headers.promise;
+        if (endStream || [204, 205, 304].includes(meta.status)) {
+            this.finishStream(stream);
+            return new Response(null, { status: meta.status, headers: meta.headers });
         }
 
-        while (true) {
-            throwIfAborted(requestInit.signal);
-            const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
-            if (frame.streamId === 0) {
-                await this.handleControlFrame(frame);
-                continue;
-            }
-            if (frame.streamId !== streamId) {
-                throw new Error(`HTTP/2: unexpected stream ${frame.streamId}`);
-            }
-            if (frame.type !== FRAME_HEADERS) {
-                throw new Error(`HTTP/2: expected response HEADERS, got frame type ${frame.type}`);
-            }
+        return new Response(stream.bodyReadable, { status: meta.status, headers: meta.headers });
+    }
 
+    createStreamState(streamId) {
+        const body = new TransformStream();
+        return {
+            streamId,
+            headers: createDeferred(),
+            headerSeen: false,
+            contentLength: null,
+            receivedBytes: 0,
+            bodyReadable: body.readable,
+            bodyWriter: body.writable.getWriter(),
+            done: false,
+        };
+    }
+
+    async readLoop() {
+        try {
+            while (!this.closed) {
+                throwIfAborted(this.signal);
+                const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
+                await this.handleFrame(frame);
+            }
+        } catch (err) {
+            if (!this.closed) this.close(toError(err));
+        }
+    }
+
+    async handleFrame(frame) {
+        if (frame.type === FRAME_CONTINUATION) {
+            throw new Error('HTTP/2: CONTINUATION without preceding HEADERS');
+        }
+        if (frame.type === FRAME_SETTINGS || frame.type === FRAME_PING || frame.type === FRAME_GOAWAY) {
+            if (frame.streamId !== 0) throw new Error('HTTP/2: connection frame with non-zero stream ID');
+            await this.handleControlFrame(frame);
+            return;
+        }
+        if (frame.type === FRAME_PRIORITY) return;
+        if (frame.type === FRAME_PUSH_PROMISE) {
+            throw new Error('HTTP/2: PUSH_PROMISE is not supported');
+        }
+        if (frame.type === FRAME_WINDOW_UPDATE) {
+            this.handleWindowUpdate(frame);
+            return;
+        }
+        if (frame.type !== FRAME_HEADERS && frame.type !== FRAME_DATA && frame.type !== FRAME_RST_STREAM) {
+            return;
+        }
+        if (frame.streamId === 0) {
+            throw new Error(`HTTP/2: ${frame.type === FRAME_DATA ? 'DATA' : 'HEADERS'} on stream 0`);
+        }
+
+        const stream = this.streams.get(frame.streamId);
+        if (!stream) return;
+
+        if (frame.type === FRAME_RST_STREAM) {
+            this.failStream(stream, new Error('HTTP/2: stream reset by peer'));
+            return;
+        }
+        if (frame.type === FRAME_HEADERS) {
             const { decoded, endStream } = await this.readHeaderBlock(frame);
-            const status = getStatusFromDecoded(decoded) || 200;
-            const responseHeaders = new Headers();
-            applyRegularHeaders(decoded, responseHeaders);
-
-            if (endStream || [101, 204, 205, 304].includes(status)) {
-                this.close();
-                return new Response(null, { status, headers: responseHeaders });
+            if (!stream.headerSeen) {
+                const meta = validateResponseHeaders(decoded, false);
+                if (meta.status === 101) {
+                    this.failStream(stream, new Error('HTTP/2: 101 Switching Protocols is not supported'));
+                    return;
+                }
+                if (meta.status >= 100 && meta.status < 200) {
+                    if (endStream) this.failStream(stream, new Error('HTTP/2: informational response ended stream'));
+                    return;
+                }
+                stream.headerSeen = true;
+                stream.contentLength = meta.contentLength;
+                if (endStream && stream.contentLength !== null && stream.contentLength !== 0) {
+                    this.failStream(stream, new Error('HTTP/2 response body truncated'));
+                    return;
+                }
+                stream.headers.resolve({ meta, endStream });
+            } else {
+                validateResponseHeaders(decoded, true);
             }
-
-            const body = this.createBodyStream(streamId, responseHeaders, requestInit.signal);
-            return new Response(body, { status, headers: responseHeaders });
+            if (endStream) this.finishStream(stream);
+            return;
         }
+        if (!stream.headerSeen) {
+            throw new Error('HTTP/2: DATA before response HEADERS');
+        }
+        const parsed = parseDataPayload(frame.payload, frame.flags);
+        if (parsed.data.byteLength > 0) {
+            stream.receivedBytes += parsed.data.byteLength;
+            if (stream.contentLength !== null && stream.receivedBytes > stream.contentLength) {
+                this.failStream(stream, new Error('HTTP/2 response body exceeded Content-Length'));
+                return;
+            }
+            await sendWindowUpdate(this.frameWriter, 0, parsed.data.byteLength);
+            await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.data.byteLength);
+            await stream.bodyWriter.write(parsed.data);
+        }
+        if (parsed.endStream) this.finishStream(stream);
     }
 
     async handleControlFrame(frame) {
@@ -254,6 +352,9 @@ class Http2SingleConnection {
             return;
         }
         if (frame.type === FRAME_PING) {
+            if (frame.payload.byteLength !== 8) {
+                throw new Error('HTTP/2: PING payload length must be 8');
+            }
             if ((frame.flags & FLAG_ACK) === 0) {
                 await writeFrame(this.frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
             }
@@ -263,20 +364,22 @@ class Http2SingleConnection {
             const errorCode = frame.payload.byteLength >= 8 ? readUint32(frame.payload, 4) : 0;
             throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
         }
-        if (frame.type === FRAME_WINDOW_UPDATE) {
-            if (frame.payload.byteLength !== 4) {
-                throw new Error('HTTP/2: malformed WINDOW_UPDATE payload');
-            }
-            const increment = readUint31(frame.payload, 0);
-            if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
-            this.windowTracker.addCredits(0, increment);
+    }
+
+    handleWindowUpdate(frame) {
+        if (frame.payload.byteLength !== 4) {
+            throw new Error('HTTP/2: malformed WINDOW_UPDATE payload');
         }
+        const increment = readUint31(frame.payload, 0);
+        if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
+        this.windowTracker.addCredits(frame.streamId, increment);
     }
 
     async readHeaderBlock(frame) {
         const parsed = parseHeadersPayload(frame.payload, frame.flags);
         const fragments = [parsed.fragment];
         let totalLength = parsed.fragment.byteLength;
+        if (totalLength > MAX_HEADER_LIST_SIZE) throw new Error('HTTP/2: header block too large');
         let isEndHeaders = parsed.endHeaders;
 
         while (!isEndHeaders) {
@@ -296,75 +399,36 @@ class Http2SingleConnection {
         };
     }
 
-    createBodyStream(streamId, responseHeaders, signal) {
-        const self = this;
-        let done = false;
-
-        return new ReadableStream({
-            async pull(controller) {
-                if (done) {
-                    controller.close();
-                    return;
-                }
-
-                while (true) {
-                    throwIfAborted(signal);
-                    const frame = await self.frameReader.readFrame(self.windowTracker.maxFrameSize);
-                    if (frame.streamId === 0) {
-                        await self.handleControlFrame(frame);
-                        continue;
-                    }
-                    if (frame.streamId !== streamId) {
-                        throw new Error(`HTTP/2: unexpected stream ${frame.streamId}`);
-                    }
-
-                    if (frame.type === FRAME_HEADERS) {
-                        const { decoded, endStream } = await self.readHeaderBlock(frame);
-                        applyTrailerHeaders(decoded, responseHeaders);
-                        if (endStream) {
-                            done = true;
-                            controller.close();
-                            self.close();
-                            return;
-                        }
-                        continue;
-                    }
-
-                    if (frame.type === FRAME_DATA) {
-                        const parsed = parseDataPayload(frame.payload, frame.flags);
-                        if (parsed.data.byteLength > 0) {
-                            await sendWindowUpdate(self.frameWriter, 0, parsed.data.byteLength);
-                            await sendWindowUpdate(self.frameWriter, streamId, parsed.data.byteLength);
-                            controller.enqueue(parsed.data);
-                        }
-                        if (parsed.endStream) {
-                            done = true;
-                            controller.close();
-                            self.close();
-                        }
-                        return;
-                    }
-
-                    if (frame.type === FRAME_RST_STREAM) {
-                        throw new Error('HTTP/2: stream reset by peer');
-                    }
-                }
-            },
-            async cancel() {
-                try {
-                    await writeFrame(self.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8]));
-                } catch (_) {
-                    // Socket may already be closed.
-                }
-                self.close();
-            },
-        });
+    finishStream(stream) {
+        if (stream.done) return;
+        stream.done = true;
+        if (stream.contentLength !== null && stream.receivedBytes !== stream.contentLength) {
+            this.failStream(stream, new Error('HTTP/2 response body truncated'));
+            return;
+        }
+        try { stream.bodyWriter.close(); } catch (_) { /* noop */ }
+        this.streams.delete(stream.streamId);
+        if (this.streams.size === 0) this.close();
     }
 
-    close() {
+    failStream(stream, err) {
+        if (stream.done) return;
+        stream.done = true;
+        stream.headers.reject(err);
+        try { stream.bodyWriter.abort(err); } catch (_) { /* noop */ }
+        this.streams.delete(stream.streamId);
+    }
+
+    close(reason) {
         if (this.closed) return;
         this.closed = true;
+        const err = reason instanceof Error ? reason : new Error('HTTP/2 connection closed');
+        if (this.signal && this.abortHandler) this.signal.removeEventListener('abort', this.abortHandler);
+        this.windowTracker.close(err);
+        for (const stream of this.streams.values()) this.failStream(stream, err);
+        try { this.frameReader.cancel(err); } catch (_) { /* noop */ }
         try { this.frameReader.releaseLock(); } catch (_) { /* noop */ }
+        try { this.frameWriter.abort(err).catch(() => { }); } catch (_) { /* noop */ }
         try { this.frameWriter.releaseLock(); } catch (_) { /* noop */ }
         try { this.tunnel.socket.close(); } catch (_) { /* noop */ }
     }
@@ -448,6 +512,10 @@ class H2FrameReader {
     releaseLock() {
         this.reader.releaseLock();
     }
+
+    cancel(reason) {
+        return this.reader.cancel(reason);
+    }
 }
 
 class WindowTracker {
@@ -461,11 +529,17 @@ class WindowTracker {
     }
 
     updateMaxFrameSize(size) {
-        this.maxFrameSize = Math.max(16384, Math.min(size, 16777215));
+        if (size < 16384 || size > 16777215) {
+            throw new Error('HTTP/2: invalid SETTINGS_MAX_FRAME_SIZE');
+        }
+        this.maxFrameSize = size;
         this._notify();
     }
 
     updateInitialWindowSize(newSize) {
+        if (newSize > MAX_WINDOW_SIZE) {
+            throw new Error('HTTP/2: invalid SETTINGS_INITIAL_WINDOW_SIZE');
+        }
         const diff = newSize - this.initialWindowSize;
         this.initialWindowSize = newSize;
         for (const [id, current] of this.streamWindows.entries()) {
@@ -492,8 +566,9 @@ class WindowTracker {
         this._notify();
     }
 
-    async waitForCredits(streamId, requestedBytes) {
+    async waitForCredits(streamId, requestedBytes, signal) {
         while (true) {
+            throwIfAborted(signal);
             const streamWin = this.streamWindows.get(streamId) || this.initialWindowSize;
             const available = Math.min(this.connectionWindow, streamWin, this.maxFrameSize);
 
@@ -504,7 +579,17 @@ class WindowTracker {
                 return take;
             }
 
-            await new Promise(resolve => this.waiters.push(resolve));
+            await new Promise((resolve, reject) => {
+                const waiter = { resolve, reject, signal, onAbort: null };
+                if (signal) {
+                    waiter.onAbort = () => {
+                        this.waiters = this.waiters.filter(w => w !== waiter);
+                        reject(makeAbortError(signal));
+                    };
+                    signal.addEventListener('abort', waiter.onAbort, { once: true });
+                }
+                this.waiters.push(waiter);
+            });
         }
     }
 
@@ -512,7 +597,19 @@ class WindowTracker {
         if (this.waiters.length > 0) {
             const resolveAll = this.waiters;
             this.waiters = [];
-            for (const r of resolveAll) r();
+            for (const w of resolveAll) {
+                if (w.signal && w.onAbort) w.signal.removeEventListener('abort', w.onAbort);
+                w.resolve();
+            }
+        }
+    }
+
+    close(err) {
+        const waiters = this.waiters;
+        this.waiters = [];
+        for (const w of waiters) {
+            if (w.signal && w.onAbort) w.signal.removeEventListener('abort', w.onAbort);
+            w.reject(err);
         }
     }
 }
@@ -529,6 +626,8 @@ class HpackDecoder {
         const out = [];
         let offset = 0;
         let headerCount = 0;
+        let headerFieldSeen = false;
+        let totalBytes = 0;
         const MAX_HEADERS = 200;
 
         while (offset < headerBlock.byteLength) {
@@ -542,7 +641,10 @@ class HpackDecoder {
             if ((b & 0x80) === 0x80) {
                 const decoded = decodeHpackInt(headerBlock, offset, 7);
                 const header = this.getByIndex(decoded.value);
-                if (header) out.push(header);
+                out.push(header);
+                totalBytes += header[0].length + header[1].length;
+                if (totalBytes > MAX_HEADER_LIST_SIZE) throw new Error('HTTP/2 HPACK: decoded header list too large');
+                headerFieldSeen = true;
                 offset = decoded.nextOffset;
                 continue;
             }
@@ -558,7 +660,7 @@ class HpackDecoder {
                     offset = nameDecoded.nextOffset;
                 } else {
                     const indexed = this.getByIndex(decoded.value);
-                    name = indexed ? indexed[0] : '';
+                    name = indexed[0];
                 }
 
                 const valueDecoded = decodeHpackString(headerBlock, offset);
@@ -566,7 +668,10 @@ class HpackDecoder {
                 offset = valueDecoded.nextOffset;
 
                 this.addDynamic(name, value);
-                if (name) out.push([name, value]);
+                out.push([name, value]);
+                totalBytes += name.length + value.length;
+                if (totalBytes > MAX_HEADER_LIST_SIZE) throw new Error('HTTP/2 HPACK: decoded header list too large');
+                headerFieldSeen = true;
                 continue;
             }
 
@@ -581,18 +686,24 @@ class HpackDecoder {
                     offset = nameDecoded.nextOffset;
                 } else {
                     const indexed = this.getByIndex(decoded.value);
-                    name = indexed ? indexed[0] : '';
+                    name = indexed[0];
                 }
 
                 const valueDecoded = decodeHpackString(headerBlock, offset);
                 const value = valueDecoded.value || '';
                 offset = valueDecoded.nextOffset;
 
-                if (name) out.push([name, value]);
+                out.push([name, value]);
+                totalBytes += name.length + value.length;
+                if (totalBytes > MAX_HEADER_LIST_SIZE) throw new Error('HTTP/2 HPACK: decoded header list too large');
+                headerFieldSeen = true;
                 continue;
             }
 
             if ((b & 0xe0) === 0x20) {
+                if (headerFieldSeen) {
+                    throw new Error('HTTP/2 HPACK: dynamic table size update after header field');
+                }
                 const decoded = decodeHpackInt(headerBlock, offset, 5);
                 this.updateDynamicSize(decoded.value);
                 offset = decoded.nextOffset;
@@ -606,12 +717,14 @@ class HpackDecoder {
     }
 
     getByIndex(index) {
-        if (index <= 0) return null;
+        if (index <= 0) throw new Error('HTTP/2 HPACK: invalid header index 0');
         if (index < HPACK_STATIC_TABLE.length) {
             return HPACK_STATIC_TABLE[index];
         }
         const dyn = index - (HPACK_STATIC_TABLE.length - 1);
-        return this.dynamicTable[dyn - 1] || null;
+        const header = this.dynamicTable[dyn - 1];
+        if (!header) throw new Error(`HTTP/2 HPACK: invalid header index ${index}`);
+        return header;
     }
 
     addDynamic(name, value) {
@@ -664,6 +777,74 @@ function getStatusFromDecoded(decoded) {
         if (!Number.isNaN(code)) return code;
     }
     return 0;
+}
+
+function validateResponseHeaders(decoded, trailers) {
+    const headers = new Headers();
+    const contentLengthValues = [];
+    let status = null;
+    let seenRegular = false;
+
+    for (const [rawName, rawValue] of decoded) {
+        const name = String(rawName);
+        const value = String(rawValue ?? '');
+
+        if (/[A-Z]/.test(name)) throw new Error(`HTTP/2: uppercase response header name: ${name}`);
+        if (name.startsWith(':')) {
+            if (trailers) throw new Error('HTTP/2: pseudo-header in trailers');
+            if (seenRegular) throw new Error('HTTP/2: pseudo-header after regular header');
+            if (name !== ':status') throw new Error(`HTTP/2: invalid response pseudo-header: ${name}`);
+            if (status !== null) throw new Error('HTTP/2: duplicate :status header');
+            if (!/^[0-9]{3}$/.test(value)) throw new Error(`HTTP/2: invalid :status value: ${value}`);
+            status = Number(value);
+            continue;
+        }
+
+        seenRegular = true;
+        if (!HEADER_NAME_RE.test(name)) throw new Error(`HTTP/2: invalid response header name: ${name}`);
+        if (!HEADER_VALUE_RE.test(value)) throw new Error(`HTTP/2: invalid response header value for ${name}`);
+        if (CONNECTION_SPECIFIC_HEADERS.has(name)) {
+            throw new Error(`HTTP/2: connection-specific response header not allowed: ${name}`);
+        }
+        if (name === 'te' && value !== 'trailers') {
+            throw new Error('HTTP/2: invalid te response header');
+        }
+        if (name === 'content-length') contentLengthValues.push(value);
+        try {
+            headers.append(name, value);
+        } catch (err) {
+            const msg = err && err.message ? err.message : String(err);
+            throw new Error(`HTTP/2: invalid response header ${name}: ${msg}`);
+        }
+    }
+
+    if (!trailers && status === null) throw new Error('HTTP/2: missing :status header');
+    return {
+        status: status || 0,
+        headers,
+        contentLength: parseStrictContentLength(contentLengthValues, 'HTTP/2'),
+    };
+}
+
+function parseStrictContentLength(values, prefix) {
+    if (values.length === 0) return null;
+    const parts = [];
+    for (const value of values) {
+        for (const part of String(value).split(',')) {
+            const trimmed = part.trim();
+            if (!/^(0|[1-9][0-9]*)$/.test(trimmed)) {
+                throw new Error(`${prefix}: invalid Content-Length: ${value}`);
+            }
+            parts.push(trimmed);
+        }
+    }
+    const first = parts[0];
+    for (const part of parts) {
+        if (part !== first) throw new Error(`${prefix}: conflicting Content-Length values`);
+    }
+    const n = Number(first);
+    if (!Number.isSafeInteger(n) || n < 0) throw new Error(`${prefix}: invalid Content-Length: ${first}`);
+    return n;
 }
 
 function applyRegularHeaders(decoded, headers) {
@@ -730,7 +911,7 @@ function parseDataPayload(payload, flags) {
     };
 }
 
-function normalizeRequestBody(body) {
+async function normalizeRequestBody(body) {
     if (body == null) return { kind: 'none' };
 
     if (typeof body === 'string') {
@@ -745,12 +926,27 @@ function normalizeRequestBody(body) {
         return { kind: 'bytes', bytes: new Uint8Array(body) };
     }
 
+    if (ArrayBuffer.isView(body)) {
+        return { kind: 'bytes', bytes: new Uint8Array(body.buffer, body.byteOffset, body.byteLength) };
+    }
+
+    if (typeof URLSearchParams === 'function' && body instanceof URLSearchParams) {
+        return { kind: 'bytes', bytes: encoder.encode(body.toString()) };
+    }
+
+    if (typeof Blob === 'function' && body instanceof Blob) {
+        return { kind: 'stream', stream: body.stream() };
+    }
+
     if (body instanceof ReadableStream) {
         return { kind: 'stream', stream: body };
     }
 
-    // Fallback to string serialization to keep behavior deterministic.
-    return { kind: 'bytes', bytes: encoder.encode(String(body)) };
+    if (typeof FormData === 'function' && body instanceof FormData) {
+        throw new Error('FormData request bodies are not supported yet');
+    }
+
+    throw new Error(`Unsupported request body type: ${Object.prototype.toString.call(body)}`);
 }
 
 function buildRequestHeaders(url, requestInit, method, bodyMode) {
@@ -863,7 +1059,7 @@ function decodeHpackInt(buf, offset, prefixBits) {
         return { value, nextOffset: offset };
     }
 
-    let m = 0;
+    let multiplier = 1;
     while (true) {
         if (offset >= buf.byteLength) {
             throw new Error('HTTP/2 HPACK: truncated integer continuation');
@@ -871,11 +1067,12 @@ function decodeHpackInt(buf, offset, prefixBits) {
         const b = buf[offset];
         offset += 1;
 
-        value += (b & 0x7f) << m;
+        value += (b & 0x7f) * multiplier;
+        if (!Number.isSafeInteger(value)) throw new Error('HTTP/2 HPACK: integer too large');
         if ((b & 0x80) === 0) break;
 
-        m += 7;
-        if (m > 28) throw new Error('HTTP/2 HPACK: integer too large');
+        multiplier *= 128;
+        if (multiplier > 2 ** 35) throw new Error('HTTP/2 HPACK: integer too large');
     }
 
     return { value, nextOffset: offset };
@@ -890,6 +1087,9 @@ function decodeHpackString(buf, offset) {
     const lengthDecoded = decodeHpackInt(buf, offset, 7);
     const length = lengthDecoded.value;
     offset = lengthDecoded.nextOffset;
+    if (length > MAX_HEADER_LIST_SIZE) {
+        throw new Error('HTTP/2 HPACK: string literal too large');
+    }
 
     if ((offset + length) > buf.byteLength) {
         throw new Error('HTTP/2 HPACK: truncated string bytes');
@@ -1018,15 +1218,16 @@ async function writeHeaderBlock(writer, streamId, headerBlock, endStream) {
     }
 }
 
-async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream) {
+async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream, signal) {
     if (!(bytes instanceof Uint8Array)) {
         bytes = new Uint8Array(bytes);
     }
 
     let offset = 0;
     while (offset < bytes.byteLength) {
+        throwIfAborted(signal);
         const remaining = bytes.byteLength - offset;
-        const take = await windowTracker.waitForCredits(streamId, remaining);
+        const take = await windowTracker.waitForCredits(streamId, remaining, signal);
 
         const chunk = bytes.subarray(offset, offset + take);
         offset += take;
@@ -1039,17 +1240,27 @@ async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream)
     }
 }
 
-async function writeDataStream(writer, windowTracker, streamId, stream) {
+async function writeDataStream(writer, windowTracker, streamId, stream, signal) {
     const reader = stream.getReader();
+    let abortHandler = null;
     try {
+        if (signal) {
+            abortHandler = () => {
+                try { reader.cancel(makeAbortError(signal)); } catch (_) { /* noop */ }
+            };
+            signal.addEventListener('abort', abortHandler, { once: true });
+        }
         while (true) {
+            throwIfAborted(signal);
             const { done, value } = await reader.read();
             if (done) break;
             const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-            await writeDataBytes(writer, windowTracker, streamId, chunk, false);
+            await writeDataBytes(writer, windowTracker, streamId, chunk, false, signal);
         }
+        throwIfAborted(signal);
         await writeFrame(writer, FRAME_DATA, FLAG_END_STREAM, streamId, new Uint8Array(0));
     } finally {
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
         try { reader.releaseLock(); } catch (_) { /* noop */ }
     }
 }
@@ -1124,6 +1335,20 @@ function concatChunks(chunks) {
         offset += c.byteLength;
     }
     return out;
+}
+
+function createDeferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
+function toError(err) {
+    return err instanceof Error ? err : new Error(String(err));
 }
 
 function makeAbortError(signal) {

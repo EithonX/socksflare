@@ -360,6 +360,7 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
     if (enableTls) {
       const tlsTunnel = await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname, {
         alpnProtocols,
+        signal,
       });
       if (signal) signal.removeEventListener('abort', abortHandler);
       return { socket, ...tlsTunnel };

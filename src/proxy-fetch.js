@@ -7,7 +7,7 @@
  * - Content-Length based responses (exact byte read, no TCP-close wait)
  * - Chunked transfer encoding (binary decoder)
  * - Direct-stream fallback (pipe until close)
- * - gzip / deflate / brotli decompression
+ * - identity-encoded responses
  *
  * @module proxy-fetch
  * @license GPL-3.0-or-later
@@ -25,6 +25,9 @@ const MAX_HEADER_SIZE = 128 * 1024;          // 128KB max response headers
 const MAX_RESPONSE_HEADERS = 200;            // max individual header lines
 const MAX_HEADER_LINE_LENGTH = 8192;         // 8KB per header line
 const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
+const MAX_CHUNK_LINE_LENGTH = 8192;          // 8KB chunk-size / trailer line cap
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 
 // ─── Main Export ────────────────────────────────────────────────────
 
@@ -53,6 +56,10 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
         };
     } else {
         url = new URL(input.toString());
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+        throw new Error(`Unsupported URL protocol: ${url.protocol}`);
     }
 
     const isHttps = url.protocol === 'https:';
@@ -214,49 +221,67 @@ async function parseResponseBinary(readable, socket, signal) {
         signal.addEventListener('abort', abortHandler, { once: true });
     }
 
-    // Accumulate bytes until we find \r\n\r\n (bounded to prevent memory DoS)
     let buffers = [];
     let totalLen = 0;
     let headerEndOffset = -1;
     let combined = null;
+    let bodyRemainder = new Uint8Array(0);
+    let status = 0;
+    let statusText = '';
+    let lines = [];
 
-    while (headerEndOffset === -1) {
-        throwIfAborted(signal);
-        let chunk;
-        try {
-            chunk = await reader.read();
-        } catch (err) {
-            const msg = err && err.message ? err.message : String(err);
-            throw new Error(`Failed reading response headers: ${msg}`);
+    while (true) {
+        // Accumulate bytes until one complete header section exists.
+        while (headerEndOffset === -1) {
+            throwIfAborted(signal);
+            let chunk;
+            try {
+                chunk = await reader.read();
+            } catch (err) {
+                const msg = err && err.message ? err.message : String(err);
+                throw new Error(`Failed reading response headers: ${msg}`);
+            }
+            const { value, done } = chunk;
+            if (done) throw new Error('SOCKS5 proxy: connection closed before headers received');
+
+            buffers.push(value);
+            totalLen += value.byteLength;
+
+            if (totalLen > MAX_HEADER_SIZE) {
+                throw new Error(`HTTP response headers too large (>${MAX_HEADER_SIZE} bytes)`);
+            }
+
+            combined = concatBuffers(buffers, totalLen);
+            headerEndOffset = findHeaderEnd(combined);
         }
-        const { value, done } = chunk;
-        if (done) throw new Error('SOCKS5 proxy: connection closed before headers received');
 
-        buffers.push(value);
-        totalLen += value.byteLength;
+        const headerBytes = combined.subarray(0, headerEndOffset);
+        bodyRemainder = combined.subarray(headerEndOffset + 4);
 
-        if (totalLen > MAX_HEADER_SIZE) {
-            throw new Error(`HTTP response headers too large (>${MAX_HEADER_SIZE} bytes)`);
+        const headerStr = decoder.decode(headerBytes);
+        lines = headerStr.split('\r\n');
+        const statusMatch = lines[0].match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\s*(.*)$/);
+        if (!statusMatch) throw new Error(`Bad HTTP response line: ${lines[0]}`);
+
+        status = parseInt(statusMatch[1], 10);
+        statusText = statusMatch[2] || '';
+
+        if (status === 101) {
+            throw new Error('HTTP upgrade responses are not supported');
         }
-
-        combined = concatBuffers(buffers, totalLen);
-        headerEndOffset = findHeaderEnd(combined);
+        if (status >= 100 && status < 200) {
+            buffers = bodyRemainder.byteLength > 0 ? [bodyRemainder] : [];
+            totalLen = bodyRemainder.byteLength;
+            combined = bodyRemainder;
+            headerEndOffset = findHeaderEnd(combined);
+            continue;
+        }
+        break;
     }
-
-    const headerBytes = combined.subarray(0, headerEndOffset);
-    const bodyRemainder = combined.subarray(headerEndOffset + 4);
-
-    // Parse status line and headers
-    const headerStr = decoder.decode(headerBytes);
-    const lines = headerStr.split('\r\n');
-    const statusMatch = lines[0].match(/^HTTP\/[\d.]+\s+(\d+)\s*(.*)/);
-    if (!statusMatch) throw new Error(`Bad HTTP response line: ${lines[0]}`);
-
-    const status = parseInt(statusMatch[1]);
-    const statusText = statusMatch[2] || '';
 
     const responseHeaders = new Headers();
     let headerCount = 0;
+    const contentLengthValues = [];
     for (let i = 1; i < lines.length; i++) {
         if (++headerCount > MAX_RESPONSE_HEADERS) {
             throw new Error(`Too many response headers (>${MAX_RESPONSE_HEADERS})`);
@@ -268,11 +293,23 @@ async function parseResponseBinary(readable, socket, signal) {
         if (idx > 0) {
             const name = lines[i].substring(0, idx).trim();
             const value = lines[i].substring(idx + 1).trim();
-            // RFC 7230 §3.2.6: reject header names with non-token characters
-            if (!/^[\x21-\x7E]+$/.test(name)) continue;
-            // Strip control characters from values (null bytes, etc.)
-            const safeValue = value.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
-            responseHeaders.append(name, safeValue);
+            if (!HEADER_NAME_RE.test(name)) {
+                throw new Error(`Invalid HTTP response header name: ${name}`);
+            }
+            if (!HEADER_VALUE_RE.test(value)) {
+                throw new Error(`Invalid HTTP response header value for ${name}`);
+            }
+            if (name.toLowerCase() === 'content-length') {
+                contentLengthValues.push(value);
+            }
+            try {
+                responseHeaders.append(name, value);
+            } catch (err) {
+                const msg = err && err.message ? err.message : String(err);
+                throw new Error(`Invalid HTTP response header ${name}: ${msg}`);
+            }
+        } else if (lines[i] !== '') {
+            throw new Error(`Malformed HTTP response header line: ${lines[i]}`);
         }
     }
 
@@ -288,8 +325,7 @@ async function parseResponseBinary(readable, socket, signal) {
     // ── Determine body strategy ──
     const transferEncoding = responseHeaders.get('transfer-encoding');
     const isChunked = transferEncoding && transferEncoding.toLowerCase().includes('chunked');
-    const contentLengthStr = responseHeaders.get('content-length');
-    const contentLength = contentLengthStr ? parseInt(contentLengthStr) : null;
+    const contentLength = parseStrictContentLength(contentLengthValues);
 
     let bodyStream;
 
@@ -343,7 +379,10 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
 
             return reader.read().then(({ value, done }) => {
                 if (done) {
-                    controller.close();
+                    const err = new Error(`HTTP response body truncated: expected ${bytesRemaining} more bytes`);
+                    cleanup();
+                    try { socket.close(); } catch (_) { /* noop */ }
+                    controller.error(err);
                     return;
                 }
                 if (value.byteLength >= bytesRemaining) {
@@ -358,7 +397,10 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
                 }
             }).catch(() => {
                 cleanup();
-                controller.close();
+                try { socket.close(); } catch (_) { /* noop */ }
+                controller.error(signal && signal.aborted
+                    ? makeAbortError(signal)
+                    : new Error(`HTTP response body truncated: expected ${bytesRemaining} more bytes`));
             });
         },
         cancel() {
@@ -375,6 +417,34 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
 function createChunkedStream(reader, initialData, socket, signal, cleanup) {
     let buffer = initialData;
     let streamDone = false;
+    const chunkDecoder = new TextDecoder();
+
+    const failWith = (controller, err) => {
+        streamDone = true;
+        cleanup();
+        try { socket.close(); } catch (_) { /* noop */ }
+        controller.error(err);
+    };
+
+    const fail = (controller, message) => {
+        failWith(controller, new Error(message));
+    };
+
+    const readMore = async (controller, eofMessage) => {
+        let result;
+        try {
+            result = await reader.read();
+        } catch (err) {
+            failWith(controller, signal && signal.aborted ? makeAbortError(signal) : toError(err));
+            return false;
+        }
+        if (result.done) {
+            failWith(controller, signal && signal.aborted ? makeAbortError(signal) : new Error(eofMessage));
+            return false;
+        }
+        buffer = appendBuffer(buffer, result.value);
+        return true;
+    };
 
     return new ReadableStream({
         async pull(controller) {
@@ -385,20 +455,42 @@ function createChunkedStream(reader, initialData, socket, signal, cleanup) {
                 const lineEnd = findCRLF(buffer);
 
                 if (lineEnd === -1) {
-                    const result = await reader.read();
-                    if (result.done) { streamDone = true; cleanup(); controller.close(); return; }
-                    buffer = appendBuffer(buffer, result.value);
+                    if (buffer.byteLength > MAX_CHUNK_LINE_LENGTH) {
+                        fail(controller, 'HTTP chunk size line too long');
+                        return;
+                    }
+                    if (!await readMore(controller, 'HTTP chunked body truncated while reading chunk size')) return;
                     continue;
                 }
 
-                const sizeStr = new TextDecoder().decode(buffer.subarray(0, lineEnd)).trim();
-                const chunkSize = parseInt(sizeStr.split(';')[0], 16);
-
-                if (isNaN(chunkSize) || chunkSize < 0 || chunkSize > MAX_CHUNK_SIZE) {
-                    streamDone = true; cleanup(); controller.close(); return;
+                if (lineEnd > MAX_CHUNK_LINE_LENGTH) {
+                    fail(controller, 'HTTP chunk size line too long');
+                    return;
                 }
 
+                const sizeStr = chunkDecoder.decode(buffer.subarray(0, lineEnd)).trim();
+                const sizeToken = sizeStr.split(';', 1)[0].trim();
+                if (!/^[0-9A-Fa-f]+$/.test(sizeToken)) {
+                    fail(controller, 'Invalid HTTP chunk size');
+                    return;
+                }
+                const chunkSize = parseInt(sizeToken, 16);
+
+                if (!Number.isSafeInteger(chunkSize) || chunkSize < 0 || chunkSize > MAX_CHUNK_SIZE) {
+                    fail(controller, 'Invalid HTTP chunk size');
+                    return;
+                }
+
+                buffer = buffer.subarray(lineEnd + 2);
+
                 if (chunkSize === 0) {
+                    while (findTrailerEnd(buffer) === -1) {
+                        if (buffer.byteLength > MAX_HEADER_SIZE) {
+                            fail(controller, 'HTTP chunk trailers too large');
+                            return;
+                        }
+                        if (!await readMore(controller, 'HTTP chunked body truncated while reading trailers')) return;
+                    }
                     streamDone = true;
                     cleanup();
                     controller.close();
@@ -406,19 +498,15 @@ function createChunkedStream(reader, initialData, socket, signal, cleanup) {
                     return;
                 }
 
-                buffer = buffer.subarray(lineEnd + 2);
-
                 // Need chunkSize data bytes + 2 bytes trailing CRLF
                 const totalNeeded = chunkSize + 2;
                 while (buffer.byteLength < totalNeeded) {
-                    const result = await reader.read();
-                    if (result.done) {
-                        if (buffer.byteLength > 0) {
-                            controller.enqueue(buffer.subarray(0, Math.min(buffer.byteLength, chunkSize)));
-                        }
-                            streamDone = true; cleanup(); controller.close(); return;
-                    }
-                    buffer = appendBuffer(buffer, result.value);
+                    if (!await readMore(controller, 'HTTP chunked body truncated while reading chunk data')) return;
+                }
+
+                if (buffer[chunkSize] !== CR || buffer[chunkSize + 1] !== LF) {
+                    fail(controller, 'HTTP chunk data missing trailing CRLF');
+                    return;
                 }
 
                 const chunkData = buffer.subarray(0, chunkSize);
@@ -482,10 +570,13 @@ async function normalizeHttp11Body(body) {
         return { kind: 'bytes', bytes: textEncoder.encode(body.toString()) };
     }
     if (typeof Blob === 'function' && body instanceof Blob) {
-        return { kind: 'bytes', bytes: new Uint8Array(await body.arrayBuffer()) };
+        return { kind: 'stream', stream: body.stream() };
     }
     if (body instanceof ReadableStream) return { kind: 'stream', stream: body };
-    return { kind: 'bytes', bytes: textEncoder.encode(String(body)) };
+    if (typeof FormData === 'function' && body instanceof FormData) {
+        throw new Error('FormData request bodies are not supported yet');
+    }
+    throw new Error(`Unsupported request body type: ${Object.prototype.toString.call(body)}`);
 }
 
 async function writeHttp11Body(writer, bodyMode, signal) {
@@ -522,6 +613,10 @@ function makeAbortError(signal) {
     return err;
 }
 
+function toError(err) {
+    return err instanceof Error ? err : new Error(String(err));
+}
+
 function throwIfAborted(signal) {
     if (signal && signal.aborted) throw makeAbortError(signal);
 }
@@ -553,6 +648,37 @@ function findCRLF(buf) {
         if (buf[i] === CR && buf[i + 1] === LF) return i;
     }
     return -1;
+}
+
+function findTrailerEnd(buf) {
+    if (buf.byteLength >= 2 && buf[0] === CR && buf[1] === LF) return 2;
+    const headerEnd = findHeaderEnd(buf);
+    return headerEnd === -1 ? -1 : headerEnd + 4;
+}
+
+function parseStrictContentLength(values) {
+    if (values.length === 0) return null;
+    const parts = [];
+    for (const value of values) {
+        for (const part of String(value).split(',')) {
+            const trimmed = part.trim();
+            if (!/^(0|[1-9][0-9]*)$/.test(trimmed)) {
+                throw new Error(`Invalid Content-Length: ${value}`);
+            }
+            parts.push(trimmed);
+        }
+    }
+    const first = parts[0];
+    for (const part of parts) {
+        if (part !== first) {
+            throw new Error(`Conflicting Content-Length values: ${values.join(', ')}`);
+        }
+    }
+    const n = Number(first);
+    if (!Number.isSafeInteger(n) || n < 0) {
+        throw new Error(`Invalid Content-Length: ${first}`);
+    }
+    return n;
 }
 
 function appendBuffer(a, b) {
