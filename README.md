@@ -23,6 +23,18 @@ Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Ed
 npm install socksflare
 ```
 
+## Testing
+
+```bash
+npm run check
+npm test
+npm run test:unit
+npm run test:integration
+npm run pack:dry
+```
+
+Integration tests use local mock HTTP and SOCKS5 servers only. No external network, Cloudflare credentials, or third-party SOCKS proxy required.
+
 ## Required: `wrangler.toml` Setup
 
 Any Worker using this library **must** include the following rule in their `wrangler.toml` so the WASM binary is bundled correctly:
