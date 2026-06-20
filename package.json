@@ -7,7 +7,7 @@
   "types": "./index.d.ts",
   "scripts": {
     "check": "node scripts/check-syntax.mjs",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test tests/protocol.test.mjs tests/integration.test.mjs tests/types-smoke.test.mjs",
     "test:unit": "node --test tests/protocol.test.mjs",
     "test:integration": "node --test tests/integration.test.mjs",
     "pack:dry": "npm pack --dry-run",
