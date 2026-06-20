@@ -2,7 +2,7 @@
  * SOCKS5 Client for Cloudflare Workers — WASM-only TLS
  *
  * For HTTP:  cloudflare:sockets → SOCKS5 → raw HTTP
- * For HTTPS: cloudflare:sockets → SOCKS5 → Rustls WASM TLS 1.3 → HTTPS
+ * For HTTPS: cloudflare:sockets → SOCKS5 → Rustls WASM TLS → HTTPS
  *
  * @module socks5-client
  * @license GPL-3.0-or-later

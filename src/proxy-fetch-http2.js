@@ -41,6 +41,7 @@ const MAX_STREAM_ID = 0x7ffffffe;              // RFC 9113: max client stream ID
 const MAX_HEADER_LIST_SIZE = 65536;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
+const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
 const CONNECTION_SPECIFIC_HEADERS = new Set([
     'connection',
     'proxy-connection',
@@ -159,7 +160,9 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const negotiated = tunnel.alpnProtocol || null;
     if (negotiated !== 'h2') {
         try { await tunnel.socket.close(); } catch (_) { /* noop */ }
-        throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
+        const err = new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
+        err.code = HTTP2_NOT_NEGOTIATED_ERROR_CODE;
+        throw err;
     }
 
     const conn = new Http2SingleConnection(tunnel, requestInit.signal);
@@ -214,6 +217,7 @@ class Http2SingleConnection {
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
 
         const bodyMode = await normalizeRequestBody(requestInit.body);
+        assertMethodBodyAllowed(method, bodyMode);
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
 
@@ -621,7 +625,11 @@ class WindowTracker {
         const diff = newSize - this.initialWindowSize;
         this.initialWindowSize = newSize;
         for (const [id, current] of this.streamWindows.entries()) {
-            this.streamWindows.set(id, current + diff);
+            const next = current + diff;
+            if (next > MAX_WINDOW_SIZE) {
+                throw new Error('HTTP/2: stream flow-control window overflow after SETTINGS_INITIAL_WINDOW_SIZE');
+            }
+            this.streamWindows.set(id, next);
         }
         this._notify();
     }
@@ -1034,6 +1042,12 @@ async function normalizeRequestBody(body) {
     }
 
     throw new Error(`Unsupported request body type: ${Object.prototype.toString.call(body)}`);
+}
+
+function assertMethodBodyAllowed(method, bodyMode) {
+    if ((method === 'GET' || method === 'HEAD') && bodyMode.kind !== 'none') {
+        throw new Error(`HTTP/2: ${method} requests cannot have a body`);
+    }
 }
 
 function buildRequestHeaders(url, requestInit, method, bodyMode) {

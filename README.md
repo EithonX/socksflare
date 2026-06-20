@@ -94,10 +94,10 @@ const response = await proxy.fetch('https://example.com', {
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
-| `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 with fallback, or require HTTP/2 |
-| `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()`) |
+| `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 then fall back only if ALPN does not negotiate `h2`, or require HTTP/2 |
+| `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()` when available, with fallback timer wiring otherwise) |
 
-**Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet.
+**Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet. `GET` and `HEAD` request bodies are rejected.
 
 **HTTP/2:** experimental single-stream implementation. Keep `httpVersion: '1.1'` for release-critical traffic until local SOCKS5/TLS/H2 integration tests pass.
 

@@ -5,7 +5,10 @@
   "type": "module",
   "main": "src/index.js",
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "check": "node scripts/check-syntax.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "pack:dry": "npm pack --dry-run",
+    "prepublishOnly": "npm run check && npm test && npm run pack:dry"
   },
   "exports": {
     ".": "./src/index.js"

@@ -29,6 +29,7 @@ const h2 = loadSource('proxy-fetch-http2.js', [
   'encodeLiteralHeaderNoIndex',
   'buildRequestHeaders',
   'concatChunks',
+  'MAX_WINDOW_SIZE',
   'FRAME_HEADERS',
   'FRAME_DATA',
   'FRAME_RST_STREAM',
@@ -39,6 +40,10 @@ const h2 = loadSource('proxy-fetch-http2.js', [
   'FLAG_END_HEADERS',
   'FLAG_END_STREAM',
   'FLAG_ACK',
+]);
+
+const tls = loadSource('wasm-tls.js', [
+  'advanceRustlsNetworkOffset',
 ]);
 
 function bytes(s) {
@@ -78,6 +83,27 @@ function fakeSocket() {
     close() {
       this.closed = true;
       return Promise.resolve();
+    },
+  };
+}
+
+function fakeTunnel(chunks) {
+  const writes = [];
+  const socket = fakeSocket();
+  return {
+    socket,
+    writes,
+    readable: streamFromChunks(chunks),
+    writable: {
+      getWriter() {
+        return {
+          write(chunk) {
+            writes.push(chunk);
+            return Promise.resolve();
+          },
+          releaseLock() {},
+        };
+      },
     },
   };
 }
@@ -237,6 +263,73 @@ test('proxyFetch rejects unsupported protocols before dialing', async () => {
     http1.proxyFetch('ftp://example.com/', {}, {}, {}),
     /Unsupported URL protocol: ftp:/,
   );
+});
+
+test('proxyFetch auto falls back to HTTP/1.1 only when HTTP/2 ALPN negotiation fails', async () => {
+  const prevProxyFetchHttp2 = globalThis.proxyFetchHttp2;
+  const prevSocks5Connect = globalThis.socks5Connect;
+
+  globalThis.proxyFetchHttp2 = async () => {
+    const err = new Error('HTTP/2 not negotiated (ALPN=http/1.1)');
+    err.code = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
+    throw err;
+  };
+  globalThis.socks5Connect = async () => fakeTunnel([
+    'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',
+  ]);
+
+  try {
+    const res = await http1.proxyFetch('https://example.com/', {}, {}, { httpVersion: 'auto' });
+    assert.equal(res.status, 200);
+    assert.equal(await res.text(), 'ok');
+  } finally {
+    globalThis.proxyFetchHttp2 = prevProxyFetchHttp2;
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('proxyFetch auto does not retry unsafe HTTP/2 failures over HTTP/1.1', async () => {
+  const prevProxyFetchHttp2 = globalThis.proxyFetchHttp2;
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let fellBack = false;
+
+  globalThis.proxyFetchHttp2 = async () => {
+    throw new Error('HTTP/2 stream write failed after request dispatch');
+  };
+  globalThis.socks5Connect = async () => {
+    fellBack = true;
+    return fakeTunnel(['HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok']);
+  };
+
+  try {
+    await assert.rejects(
+      http1.proxyFetch('https://example.com/', { method: 'POST', body: 'x' }, {}, { httpVersion: 'auto' }),
+      /stream write failed/,
+    );
+    assert.equal(fellBack, false);
+  } finally {
+    globalThis.proxyFetchHttp2 = prevProxyFetchHttp2;
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/1.1 rejects GET request body before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      http1.proxyFetch('http://example.com/', { method: 'GET', body: 'x' }, {}, {}),
+      /HTTP\/1\.1: GET requests cannot have a body/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
 });
 
 test('HTTP/1.1 streaming upload abort wakes pending read', async () => {
@@ -435,6 +528,15 @@ test('WindowTracker addCredits when stream window is zero yields correct value',
   assert.equal(tracker.streamWindows.get(1), 10);
 });
 
+test('WindowTracker rejects SETTINGS_INITIAL_WINDOW_SIZE overflow for existing stream', () => {
+  const tracker = new h2.WindowTracker();
+  tracker.streamWindows.set(1, h2.MAX_WINDOW_SIZE);
+  assert.throws(
+    () => tracker.updateInitialWindowSize(h2.MAX_WINDOW_SIZE),
+    /overflow after SETTINGS_INITIAL_WINDOW_SIZE/,
+  );
+});
+
 test('HTTP/2 304 with content-length and END_STREAM returns null body without error', async () => {
   const { conn } = h2Conn();
   const stream = conn.createStreamState(1);
@@ -606,6 +708,15 @@ test('HTTP/2 invalid method rejects', async () => {
   await assert.rejects(
     conn.fetch(new URL('https://example.com/'), { method: 'get bad' }),
     /invalid method/,
+  );
+});
+
+test('HTTP/2 rejects HEAD request body before sending request', async () => {
+  const { conn } = h2Conn();
+  await conn.init();
+  await assert.rejects(
+    conn.fetch(new URL('https://example.com/'), { method: 'HEAD', body: 'x' }),
+    /HTTP\/2: HEAD requests cannot have a body/,
   );
 });
 
@@ -789,4 +900,17 @@ test('HTTP/2 fetch returns null body for HEAD 200 without END_STREAM on HEADERS'
 
   await new Promise(r => setTimeout(r, 0));
   assert.equal(socket.closed, true);
+});
+
+test('wasmTls rejects zero-byte Rustls consumption from non-empty network chunk', () => {
+  const client = {
+    provide_network_data() {
+      return 0;
+    },
+  };
+
+  assert.throws(
+    () => tls.advanceRustlsNetworkOffset(client, bytes('abc'), 0),
+    /Rustls consumed 0 bytes from non-empty network data/,
+  );
 });

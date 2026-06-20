@@ -28,6 +28,7 @@ const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
 const MAX_CHUNK_LINE_LENGTH = 8192;          // 8KB chunk-size / trailer line cap
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
+const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
 
 // ─── Main Export ────────────────────────────────────────────────────
 
@@ -73,10 +74,9 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
                 tlsHostname: options.tlsHostname,
             });
         } catch (err) {
-            if (requestedVersion === '2') {
+            if (requestedVersion === '2' || !shouldFallbackToHttp11(err)) {
                 throw err;
             }
-            // auto mode: fall through to HTTP/1.1 path
         }
     }
 
@@ -95,6 +95,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     throwIfAborted(signal);
     const method = (requestInit.method || 'GET').toUpperCase();
     const bodyMode = await normalizeHttp11Body(requestInit.body);
+    assertMethodBodyAllowed(method, bodyMode, 'HTTP/1.1');
 
     // Establish SOCKS5 tunnel (with WASM TLS if HTTPS)
     tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
@@ -622,6 +623,16 @@ function makeAbortError(signal) {
     const err = new Error('Aborted');
     err.name = 'AbortError';
     return err;
+}
+
+function shouldFallbackToHttp11(err) {
+    return !!(err && err.code === HTTP2_NOT_NEGOTIATED_ERROR_CODE);
+}
+
+function assertMethodBodyAllowed(method, bodyMode, protocol) {
+    if ((method === 'GET' || method === 'HEAD') && bodyMode.kind !== 'none') {
+        throw new Error(`${protocol}: ${method} requests cannot have a body`);
+    }
 }
 
 function toError(err) {

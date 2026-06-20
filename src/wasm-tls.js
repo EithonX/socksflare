@@ -1,7 +1,7 @@
 /**
  * WASM TLS Bridge — JavaScript glue for the Rustls WASM module.
  *
- * Handles the TLS 1.3 handshake and bidirectional data pump between
+ * Handles TLS handshake and bidirectional data pump between
  * the raw SOCKS5 TCP tunnel and the application-layer streams.
  *
  * CRITICAL: The networkPump() loop feeds data to provide_network_data()
@@ -19,7 +19,7 @@ import wasmModule from '../rust-tls-wasm/pkg/rust_tls_wasm_bg.wasm';
 let wasmInitialized = false;
 
 /**
- * Performs a TLS 1.3 handshake over existing readable/writable streams
+ * Performs TLS handshake over existing readable/writable streams
  * using the Rustls WASM module.
  *
  * @param {ReadableStream} networkReadable - Raw TCP readable (from SOCKS5 tunnel).
@@ -269,12 +269,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                         while (!closed && offset < value.length) {
                             const chunk = value.subarray(offset);
                             try {
-                                const consumed = client.provide_network_data(chunk);
-                                offset += consumed;
-
-                                // consumed === 0 means Rustls can't process more right now.
-                                // Break to avoid infinite loop (connection closed or stalled).
-                                if (consumed === 0) break;
+                                offset = advanceRustlsNetworkOffset(client, value, offset);
                             } catch (err) {
                                 const e = toError(err);
                                 teardown(e);
@@ -311,4 +306,13 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
             teardown(toError(e));
         });
     });
+}
+
+function advanceRustlsNetworkOffset(client, sourceChunk, offset) {
+    const chunk = sourceChunk.subarray(offset);
+    const consumed = client.provide_network_data(chunk);
+    if (chunk.byteLength > 0 && consumed === 0) {
+        throw new Error('wasmTls: Rustls consumed 0 bytes from non-empty network data');
+    }
+    return offset + consumed;
 }
