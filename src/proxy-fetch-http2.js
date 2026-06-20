@@ -133,24 +133,43 @@ const HPACK_HUFFMAN_CODE_LENGTHS = [
 
 const HPACK_HUFFMAN_DECODE_TREE = buildHpackHuffmanDecodeTree();
 
-class Http2Connection {
-    constructor(tunnel, pool, poolKey) {
+export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, options = {}) {
+    const targetHost = url.hostname;
+    const targetPort = parseInt(url.port, 10) || 443;
+    const tlsHostname = options.tlsHostname || targetHost;
+
+    const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
+        enableTls: true,
+        tlsHostname,
+        alpnProtocols: ['h2', 'http/1.1'],
+        signal: requestInit.signal,
+    });
+
+    const negotiated = tunnel.alpnProtocol || null;
+    if (negotiated !== 'h2') {
+        try { await tunnel.socket.close(); } catch (_) { /* noop */ }
+        throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
+    }
+
+    const conn = new Http2SingleConnection(tunnel);
+    try {
+        await conn.init();
+        return await conn.fetch(url, requestInit);
+    } catch (err) {
+        conn.close(err);
+        throw err;
+    }
+}
+
+class Http2SingleConnection {
+    constructor(tunnel) {
         this.tunnel = tunnel;
-        this.pool = pool;
-        this.poolKey = poolKey;
         this.frameReader = new H2FrameReader(tunnel.readable.getReader());
         this.frameWriter = tunnel.writable.getWriter();
         this.hpackDecoder = new HpackDecoder(DEFAULT_HEADER_TABLE_SIZE);
         this.windowTracker = new WindowTracker();
-
-        this.nextStreamId = 1;
-        this.streams = new Map();
         this.settingsAckPending = false;
-
         this.closed = false;
-        this.closeError = null;
-
-        this._readLoopPromise = this._startReadLoop().catch(() => { });
     }
 
     async init() {
@@ -163,319 +182,192 @@ class Http2Connection {
     }
 
     async fetch(url, requestInit) {
-        if (this.closed) throw this.closeError || new Error('HTTP/2 Connection Closed');
         throwIfAborted(requestInit.signal);
 
-        // M2: Stream ID exhaustion check
-        if (this.nextStreamId > MAX_STREAM_ID) {
-            this.close(new Error('HTTP/2: stream ID space exhausted'));
-            throw new Error('HTTP/2: stream ID space exhausted, open a new connection');
-        }
-
-        const streamId = this.nextStreamId;
-        this.nextStreamId += 2;
+        const streamId = 1;
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
-
         const method = (requestInit.method || 'GET').toUpperCase();
         const bodyMode = normalizeRequestBody(requestInit.body);
-
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
-        let headersSent = false;
 
-        let resolveResponse;
-        let rejectResponse;
-        const responsePromise = new Promise((resolve, reject) => {
-            resolveResponse = resolve;
-            rejectResponse = reject;
-        });
-
-        const streamState = {
-            responseDeferred: { resolve: resolveResponse, reject: rejectResponse },
-            controller: null,
-            pushBuffer: [],
-            responseHeaders: new Headers(),
-            status: 200,
-            abortHandler: null,
-            signal: requestInit.signal,
-            endStreamSeen: false
-        };
-        this.streams.set(streamId, streamState);
-
-        if (requestInit.signal) {
-            streamState.abortHandler = async () => {
-                if (headersSent) {
-                    try {
-                        await writeFrame(this.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8])); // CANCEL
-                    } catch (_) {
-                        // Connection may already be closed by the abort.
-                    }
-                }
-                const s = this.streams.get(streamId);
-                if (s) {
-                    const err = makeAbortError(requestInit.signal);
-                    s.responseDeferred.reject(err);
-                    if (s.controller) s.controller.error(err);
-                    this._cleanupStream(streamId);
-                }
-            };
-            requestInit.signal.addEventListener('abort', streamState.abortHandler, { once: true });
-            if (requestInit.signal.aborted) {
-                void streamState.abortHandler();
-            }
-        }
-
-        try {
-            await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
-            headersSent = true;
-        } catch (err) {
-            this._cleanupStream(streamId);
-            throw err;
-        }
-
+        await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
         if (hasBody) {
-            void (async () => {
-                try {
-                    if (bodyMode.kind === 'bytes') {
-                        await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
-                    } else if (bodyMode.kind === 'stream') {
-                        await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
-                    }
-                } catch (err) {
-                    if (this.streams.has(streamId)) {
-                        rejectResponse(err);
-                        this._cleanupStream(streamId);
-                    }
-                }
-            })();
-        }
-
-        return responsePromise;
-    }
-
-    async _startReadLoop() {
-        let floodCounter = 0;
-        const FLOOD_LIMIT = 100;
-        try {
-            while (!this.closed) {
-                const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
-
-                if (frame.streamId === 0) {
-                    floodCounter++;
-                    if (frame.type === FRAME_SETTINGS) {
-                        if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
-                            if (frame.payload.byteLength !== 0) {
-                                throw new Error('HTTP/2: SETTINGS ACK with non-empty payload');
-                            }
-                            if (this.settingsAckPending) {
-                                this.settingsAckPending = false;
-                                this.hpackDecoder.setSettingsMaxDynamicSize(ADVERTISED_HEADER_TABLE_SIZE);
-                            }
-                        } else {
-                            if (frame.payload.byteLength % 6 !== 0) {
-                                throw new Error('HTTP/2: malformed SETTINGS payload length');
-                            }
-                            for (let i = 0; i < frame.payload.byteLength; i += 6) {
-                                const id = readUint16(frame.payload, i);
-                                const val = readUint32(frame.payload, i + 2);
-                                if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
-                                else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
-                            }
-                            await writeFrame(this.frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
-                        }
-                    } else if (frame.type === FRAME_PING) {
-                        if ((frame.flags & FLAG_ACK) === 0) {
-                            await writeFrame(this.frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
-                        }
-                    } else if (frame.type === FRAME_GOAWAY) {
-                        const errorCode = frame.payload.byteLength >= 8 ? readUint32(frame.payload, 4) : 0;
-                        throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
-                    } else if (frame.type === FRAME_WINDOW_UPDATE) {
-                        if (frame.payload.byteLength === 4) {
-                            const increment = readUint31(frame.payload, 0);
-                            // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
-                            if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
-                            this.windowTracker.addCredits(0, increment);
-                        }
-                    }
-                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                    continue;
-                }
-
-                const stream = this.streams.get(frame.streamId);
-                if (!stream) {
-                    floodCounter++;
-                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                    continue;
-                }
-
-                if (frame.type === FRAME_WINDOW_UPDATE) {
-                    if (frame.payload.byteLength === 4) {
-                        const increment = readUint31(frame.payload, 0);
-                        // H4: RFC 9113 §6.9 — increment of 0 is PROTOCOL_ERROR
-                        if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
-                        this.windowTracker.addCredits(frame.streamId, increment);
-                    }
-                    floodCounter++;
-                    if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Control frame flood detected');
-                    continue;
-                }
-
-                if (frame.type === FRAME_HEADERS) {
-                    floodCounter = 0;
-
-                    const fragments = [parseHeadersPayload(frame.payload, frame.flags).fragment];
-                    let totalLength = fragments[0].byteLength;
-                    let isEndHeaders = (frame.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS;
-                    let isEndStream = (frame.flags & FLAG_END_STREAM) === FLAG_END_STREAM;
-
-                    while (!isEndHeaders) {
-                        const cframe = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
-                        if (cframe.streamId !== frame.streamId || cframe.type !== FRAME_CONTINUATION) {
-                            throw new Error('HTTP/2: invalid continuation sequence');
-                        }
-                        fragments.push(cframe.payload);
-                        totalLength += cframe.payload.byteLength;
-                        if (totalLength > MAX_HEADER_LIST_SIZE) throw new Error('CVE-2024-27316 block');
-                        isEndHeaders = (cframe.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS;
-                    }
-
-                    const decoded = this.hpackDecoder.decode(concatChunks(fragments));
-
-                    if (!stream.controller) {
-                        stream.status = getStatusFromDecoded(decoded) || 200;
-                        applyRegularHeaders(decoded, stream.responseHeaders);
-
-                        const self = this;
-                        const streamId = frame.streamId;
-                        const bodyStream = new ReadableStream({
-                            start(controller) {
-                                stream.controller = controller;
-                                for (const chunk of stream.pushBuffer) controller.enqueue(chunk);
-                                stream.pushBuffer = [];
-                                if (isEndStream || stream.endStreamSeen) {
-                                    controller.close();
-                                    self._cleanupStream(streamId);
-                                }
-                            },
-                            async cancel() {
-                                await writeFrame(self.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8]));
-                                self._cleanupStream(streamId);
-                            }
-                        });
-
-                        stream.responseDeferred.resolve(new Response(bodyStream, {
-                            status: stream.status,
-                            headers: stream.responseHeaders
-                        }));
-                    } else {
-                        applyTrailerHeaders(decoded, stream.responseHeaders);
-                    }
-
-                    if (isEndStream) {
-                        stream.endStreamSeen = true;
-                        if (stream.controller) {
-                            stream.controller.close();
-                            this._cleanupStream(frame.streamId);
-                        }
-                    }
-                    continue;
-                }
-
-                if (frame.type === FRAME_DATA) {
-                    const parsed = parseDataPayload(frame.payload, frame.flags);
-                    if (parsed.data.byteLength > 0) {
-                        floodCounter = 0;
-                        await sendWindowUpdate(this.frameWriter, 0, parsed.data.byteLength);
-                        await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.data.byteLength);
-
-                        if (stream.controller) {
-                            stream.controller.enqueue(parsed.data);
-                        } else {
-                            stream.pushBuffer.push(parsed.data);
-                        }
-                    } else {
-                        floodCounter++;
-                        if (floodCounter > FLOOD_LIMIT) throw new Error('HTTP/2: Empty DATA frame flood detected');
-                    }
-
-                    if (parsed.endStream) {
-                        stream.endStreamSeen = true;
-                        if (stream.controller) {
-                            stream.controller.close();
-                            this._cleanupStream(frame.streamId);
-                        }
-                    }
-                    continue;
-                }
-
-                if (frame.type === FRAME_RST_STREAM) {
-                    if (stream.responseDeferred.reject) stream.responseDeferred.reject(new Error('HTTP/2: stream reset by peer'));
-                    if (stream.controller) stream.controller.error(new Error('HTTP/2: stream reset by peer'));
-                    this._cleanupStream(frame.streamId);
-                    continue;
-                }
+            if (bodyMode.kind === 'bytes') {
+                await writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true);
+            } else if (bodyMode.kind === 'stream') {
+                await writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream);
             }
-        } catch (err) {
-            this.close(err);
+        }
+
+        while (true) {
+            throwIfAborted(requestInit.signal);
+            const frame = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
+            if (frame.streamId === 0) {
+                await this.handleControlFrame(frame);
+                continue;
+            }
+            if (frame.streamId !== streamId) {
+                throw new Error(`HTTP/2: unexpected stream ${frame.streamId}`);
+            }
+            if (frame.type !== FRAME_HEADERS) {
+                throw new Error(`HTTP/2: expected response HEADERS, got frame type ${frame.type}`);
+            }
+
+            const { decoded, endStream } = await this.readHeaderBlock(frame);
+            const status = getStatusFromDecoded(decoded) || 200;
+            const responseHeaders = new Headers();
+            applyRegularHeaders(decoded, responseHeaders);
+
+            if (endStream || [101, 204, 205, 304].includes(status)) {
+                this.close();
+                return new Response(null, { status, headers: responseHeaders });
+            }
+
+            const body = this.createBodyStream(streamId, responseHeaders, requestInit.signal);
+            return new Response(body, { status, headers: responseHeaders });
         }
     }
 
-    _cleanupStream(streamId) {
-        const s = this.streams.get(streamId);
-        if (s) {
-            if (s.abortHandler && s.signal) s.signal.removeEventListener('abort', s.abortHandler);
-            this.streams.delete(streamId);
+    async handleControlFrame(frame) {
+        if (frame.type === FRAME_SETTINGS) {
+            if ((frame.flags & FLAG_ACK) === FLAG_ACK) {
+                if (frame.payload.byteLength !== 0) {
+                    throw new Error('HTTP/2: SETTINGS ACK with non-empty payload');
+                }
+                if (this.settingsAckPending) {
+                    this.settingsAckPending = false;
+                    this.hpackDecoder.setSettingsMaxDynamicSize(ADVERTISED_HEADER_TABLE_SIZE);
+                }
+                return;
+            }
+            if (frame.payload.byteLength % 6 !== 0) {
+                throw new Error('HTTP/2: malformed SETTINGS payload length');
+            }
+            for (let i = 0; i < frame.payload.byteLength; i += 6) {
+                const id = readUint16(frame.payload, i);
+                const val = readUint32(frame.payload, i + 2);
+                if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
+                else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
+            }
+            await writeFrame(this.frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
+            return;
+        }
+        if (frame.type === FRAME_PING) {
+            if ((frame.flags & FLAG_ACK) === 0) {
+                await writeFrame(this.frameWriter, FRAME_PING, FLAG_ACK, 0, frame.payload);
+            }
+            return;
+        }
+        if (frame.type === FRAME_GOAWAY) {
+            const errorCode = frame.payload.byteLength >= 8 ? readUint32(frame.payload, 4) : 0;
+            throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
+        }
+        if (frame.type === FRAME_WINDOW_UPDATE) {
+            if (frame.payload.byteLength !== 4) {
+                throw new Error('HTTP/2: malformed WINDOW_UPDATE payload');
+            }
+            const increment = readUint31(frame.payload, 0);
+            if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
+            this.windowTracker.addCredits(0, increment);
         }
     }
 
-    close(err) {
+    async readHeaderBlock(frame) {
+        const parsed = parseHeadersPayload(frame.payload, frame.flags);
+        const fragments = [parsed.fragment];
+        let totalLength = parsed.fragment.byteLength;
+        let isEndHeaders = parsed.endHeaders;
+
+        while (!isEndHeaders) {
+            const cframe = await this.frameReader.readFrame(this.windowTracker.maxFrameSize);
+            if (cframe.streamId !== frame.streamId || cframe.type !== FRAME_CONTINUATION) {
+                throw new Error('HTTP/2: invalid continuation sequence');
+            }
+            fragments.push(cframe.payload);
+            totalLength += cframe.payload.byteLength;
+            if (totalLength > MAX_HEADER_LIST_SIZE) throw new Error('HTTP/2: header block too large');
+            isEndHeaders = (cframe.flags & FLAG_END_HEADERS) === FLAG_END_HEADERS;
+        }
+
+        return {
+            decoded: this.hpackDecoder.decode(concatChunks(fragments)),
+            endStream: parsed.endStream,
+        };
+    }
+
+    createBodyStream(streamId, responseHeaders, signal) {
+        const self = this;
+        let done = false;
+
+        return new ReadableStream({
+            async pull(controller) {
+                if (done) {
+                    controller.close();
+                    return;
+                }
+
+                while (true) {
+                    throwIfAborted(signal);
+                    const frame = await self.frameReader.readFrame(self.windowTracker.maxFrameSize);
+                    if (frame.streamId === 0) {
+                        await self.handleControlFrame(frame);
+                        continue;
+                    }
+                    if (frame.streamId !== streamId) {
+                        throw new Error(`HTTP/2: unexpected stream ${frame.streamId}`);
+                    }
+
+                    if (frame.type === FRAME_HEADERS) {
+                        const { decoded, endStream } = await self.readHeaderBlock(frame);
+                        applyTrailerHeaders(decoded, responseHeaders);
+                        if (endStream) {
+                            done = true;
+                            controller.close();
+                            self.close();
+                            return;
+                        }
+                        continue;
+                    }
+
+                    if (frame.type === FRAME_DATA) {
+                        const parsed = parseDataPayload(frame.payload, frame.flags);
+                        if (parsed.data.byteLength > 0) {
+                            await sendWindowUpdate(self.frameWriter, 0, parsed.data.byteLength);
+                            await sendWindowUpdate(self.frameWriter, streamId, parsed.data.byteLength);
+                            controller.enqueue(parsed.data);
+                        }
+                        if (parsed.endStream) {
+                            done = true;
+                            controller.close();
+                            self.close();
+                        }
+                        return;
+                    }
+
+                    if (frame.type === FRAME_RST_STREAM) {
+                        throw new Error('HTTP/2: stream reset by peer');
+                    }
+                }
+            },
+            async cancel() {
+                try {
+                    await writeFrame(self.frameWriter, FRAME_RST_STREAM, 0, streamId, new Uint8Array([0, 0, 0, 8]));
+                } catch (_) {
+                    // Socket may already be closed.
+                }
+                self.close();
+            },
+        });
+    }
+
+    close() {
         if (this.closed) return;
         this.closed = true;
-        this.closeError = err;
-        if (this.pool && this.poolKey) this.pool.delete(this.poolKey);
-
-        for (const [id, stream] of this.streams.entries()) {
-            if (stream.abortHandler && stream.signal) stream.signal.removeEventListener('abort', stream.abortHandler);
-            const rejectErr = err || new Error('HTTP/2 Connection Closed');
-            if (stream.responseDeferred && stream.responseDeferred.reject) stream.responseDeferred.reject(rejectErr);
-            if (stream.controller) stream.controller.error(rejectErr);
-        }
-        this.streams.clear();
-        try { this.tunnel.socket.close(); } catch (_) { }
+        try { this.frameReader.releaseLock(); } catch (_) { /* noop */ }
+        try { this.frameWriter.releaseLock(); } catch (_) { /* noop */ }
+        try { this.tunnel.socket.close(); } catch (_) { /* noop */ }
     }
-}
-
-export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, options = {}) {
-    const targetHost = url.hostname;
-    const targetPort = parseInt(url.port, 10) || 443;
-    const tlsHostname = options.tlsHostname || targetHost;
-
-    const pool = options.http2Pool;
-    // H2: Pool key includes actual target host to prevent cross-origin reuse
-    const poolKey = `${targetHost}:${targetPort}:${tlsHostname}`;
-
-    let conn = pool ? pool.get(poolKey) : null;
-
-    if (!conn || conn.closed) {
-        const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
-            enableTls: true,
-            tlsHostname,
-            alpnProtocols: ['h2', 'http/1.1'],
-        });
-
-        const negotiated = tunnel.alpnProtocol || null;
-        if (negotiated !== 'h2') {
-            try { await tunnel.socket.close(); } catch (_) { /* noop */ }
-            throw new Error(`HTTP/2 not negotiated (ALPN=${negotiated || 'none'})`);
-        }
-
-        conn = new Http2Connection(tunnel, pool, poolKey);
-        await conn.init();
-        if (pool) pool.set(poolKey, conn);
-    }
-
-    return conn.fetch(url, requestInit);
 }
 
 class H2FrameReader {

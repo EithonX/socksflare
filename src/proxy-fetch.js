@@ -64,7 +64,6 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
         try {
             return await proxyFetchHttp2(url, requestInit, proxyConfig, {
                 tlsHostname: options.tlsHostname,
-                http2Pool: options.http2Pool,
             });
         } catch (err) {
             if (requestedVersion === '2') {
