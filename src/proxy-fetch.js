@@ -32,7 +32,7 @@ const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 // ─── Main Export ────────────────────────────────────────────────────
 
 /**
- * Drop-in fetch() replacement that routes through a SOCKS5 proxy.
+ * Fetch-like helper that routes HTTP(S) requests through a SOCKS5 proxy.
  *
  * @param {string|URL|Request} input - URL or Request object.
  * @param {RequestInit} [init] - Standard fetch init options.
@@ -588,7 +588,14 @@ async function writeHttp11Body(writer, bodyMode, signal) {
     }
 
     const reader = bodyMode.stream.getReader();
+    let abortHandler = null;
     try {
+        if (signal) {
+            abortHandler = () => {
+                try { reader.cancel(makeAbortError(signal)); } catch (_) { /* noop */ }
+            };
+            signal.addEventListener('abort', abortHandler, { once: true });
+        }
         while (true) {
             throwIfAborted(signal);
             const { value, done } = await reader.read();
@@ -601,6 +608,7 @@ async function writeHttp11Body(writer, bodyMode, signal) {
         }
         await writer.write(textEncoder.encode('0\r\n\r\n'));
     } finally {
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
         try { reader.releaseLock(); } catch (_) { /* noop */ }
     }
 }

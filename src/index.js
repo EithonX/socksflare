@@ -1,5 +1,5 @@
 /**
- * Socksflare — SOCKS5 proxy client for Cloudflare Workers with TLS 1.3 via Rustls WASM.
+ * Socksflare — SOCKS5 proxy client for Cloudflare Workers with TLS via Rustls WASM.
  *
  * @module socksflare
  * @license GPL-3.0-or-later
@@ -14,7 +14,7 @@
  *   password: 'pass',
  * });
  *
- * // Drop-in fetch replacement
+ * // Fetch-like helper routed through SOCKS5
  * const response = await proxy.fetch('https://example.com');
  *
  * // Raw tunnel for non-HTTP protocols
@@ -58,7 +58,7 @@ export class Socks5Client {
     }
 
     /**
-     * Drop-in replacement for `fetch()` — routes through SOCKS5 + Rustls WASM TLS.
+     * Fetch-like helper — routes through SOCKS5 + Rustls WASM TLS.
      *
      * @param {string|URL|Request} input - URL or Request object.
      * @param {RequestInit} [init] - Standard fetch init options (supports `init.signal`).
@@ -96,7 +96,7 @@ export class Socks5Client {
      * @param {string} targetHost - Destination hostname or IP.
      * @param {number} targetPort - Destination port.
      * @param {Object} [options] - Connection options.
-     * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS 1.3.
+     * @param {boolean} [options.enableTls=false] - Upgrade tunnel with Rustls WASM TLS.
      * @param {string} [options.tlsHostname] - SNI hostname (defaults to targetHost).
      * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
      * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}

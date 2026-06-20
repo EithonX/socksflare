@@ -1,8 +1,8 @@
 # Socksflare
 
-**SOCKS5 proxy client for Cloudflare Workers with TLS 1.3 via Rustls WASM.**
+**SOCKS5 proxy client for Cloudflare Workers with TLS via Rustls WASM.**
 
-Route any HTTP(S) request through a SOCKS5 proxy from the Cloudflare Edge — no external relay, no `startTls()`, no JS TLS fallback. TLS is handled entirely by [Rustls](https://github.com/rustls/rustls) compiled to WebAssembly: memory-safe, constant-time, production-grade.
+Route HTTP(S) requests through a SOCKS5 proxy from the Cloudflare Edge — no external relay, no `startTls()`, no JS TLS fallback. TLS is handled entirely by [Rustls](https://github.com/rustls/rustls) compiled to WebAssembly: memory-safe, constant-time, production-grade.
 
 > [!WARNING]
 > **This project is experimental and provided as-is.** It has not undergone a formal security audit. The TLS implementation relies on Rustls WASM, which may have a different fingerprint than standard browsers. **Use at your own risk.** The author(s) make no guarantees regarding security, reliability, or fitness for any particular purpose.
@@ -15,7 +15,7 @@ Route any HTTP(S) request through a SOCKS5 proxy from the Cloudflare Edge — no
 
 ## Why not `startTls()`?
 
-Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Edge, making it unusable for proxied HTTPS connections where the SNI hostname differs from the proxy hostname. This library bypasses that limitation entirely by performing the TLS 1.3 handshake in userspace via Rustls WASM.
+Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Edge, making it unusable for proxied HTTPS connections where the SNI hostname differs from the proxy hostname. This library bypasses that limitation entirely by performing TLS in userspace via Rustls WASM.
 
 ## Installation
 
@@ -60,7 +60,7 @@ export default {
       return new Response('Hostname not allowed', { status: 403 });
     }
 
-    // Drop-in fetch() replacement — routes through SOCKS5 + TLS 1.3
+    // Fetch-like helper — routes through SOCKS5 + Rustls WASM TLS
     return proxy.fetch(target, {}, { timeoutMs: 15000 });
   },
 };
@@ -79,7 +79,7 @@ export default {
 
 ### `client.fetch(input, init?, options?)`
 
-Drop-in replacement for the standard `fetch()` API. Routes the request through the SOCKS5 proxy with automatic TLS for HTTPS URLs.
+Fetch-like helper for routing requests through the SOCKS5 proxy with automatic TLS for HTTPS URLs. It does not yet match every native `fetch()` behavior.
 
 ```javascript
 const response = await proxy.fetch('https://example.com', {
@@ -96,6 +96,10 @@ const response = await proxy.fetch('https://example.com', {
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
 | `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 with fallback, or require HTTP/2 |
 | `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()`) |
+
+**Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet.
+
+**HTTP/2:** experimental single-stream implementation. Keep `httpVersion: '1.1'` for release-critical traffic until local SOCKS5/TLS/H2 integration tests pass.
 
 ### `client.connect(targetHost, targetPort, options?)`
 
@@ -152,11 +156,12 @@ socksflare/
 │   ├── index.js             ← Main export: Socks5Client class
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
 │   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
-│   ├── proxy-fetch-http2.js ← HTTP/2 path (multiplexed)
+│   ├── proxy-fetch-http2.js ← Experimental single-stream HTTP/2 path
 │   └── wasm-tls.js          ← JS bridge to Rustls WASM
 ├── rust-tls-wasm/
 │   ├── src/lib.rs           ← Rustls WasmTlsClient
 │   ├── Cargo.toml           ← rustls 0.23, ring 0.17, wasm-bindgen 0.2
+│   ├── Cargo.lock           ← Reproducible WASM dependency lockfile
 │   └── pkg/                 ← Pre-built WASM output (committed)
 ├── example/
 │   └── worker.js            ← Demo worker
@@ -169,6 +174,8 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
+- **HTTP/2:** Experimental and single-stream. It has protocol hardening, but should not be treated as release-grade until integration tests cover flow control, aborts, malformed frames, and body cancellation.
+- **FormData:** Request bodies using `FormData` are rejected for now.
 - **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
 
 ## Contributing

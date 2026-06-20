@@ -28,6 +28,7 @@ let wasmInitialized = false;
  * @param {Object} [options] - TLS handshake options.
  * @param {string[]} [options.alpnProtocols] - ALPN protocol list in preference order.
  * @param {AbortSignal} [options.signal] - Abort signal for handshake/tunnel teardown.
+ * @param {number} [options.maxQueuedAppBytes=4194304] - Max decrypted bytes queued when caller is slow.
  * @returns {Promise<{readable: ReadableStream, writable: WritableStream, alpnProtocol: string|null}>}
  *   Application-layer streams carrying decrypted data.
  */
@@ -39,6 +40,9 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
 
     const toError = (err) => err instanceof Error ? err : new Error(String(err));
     const signal = options.signal;
+    const maxQueuedAppBytes = Number.isInteger(options.maxQueuedAppBytes) && options.maxQueuedAppBytes > 0
+        ? options.maxQueuedAppBytes
+        : 4 * 1024 * 1024;
     const alpnProtocols = Array.isArray(options.alpnProtocols)
         ? options.alpnProtocols.map(p => String(p).trim()).filter(Boolean)
         : [];
@@ -61,12 +65,24 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
         throw abortError();
     }
 
-    // Application-layer readable stream (decrypted data for the caller)
     let appReadableController = null;
+    let queuedAppBytes = 0;
+    const appQueue = [];
+    let demandWaiters = [];
+
     const appReadable = new ReadableStream({
         start(controller) {
             appReadableController = controller;
-        }
+        },
+        pull() {
+            flushAppQueue();
+            wakeDemand();
+        },
+        cancel(reason) {
+            teardown(reason instanceof Error ? reason : new Error('wasmTls: app readable cancelled'), {
+                readableError: false,
+            });
+        },
     });
 
     const networkReader = networkReadable.getReader();
@@ -113,12 +129,57 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
         }
         try { networkReader.cancel(err).catch(() => { }); } catch (_) { /* noop */ }
         try { networkWriter.abort(err).catch(() => { }); } catch (_) { /* noop */ }
+        wakeDemand();
         freeOnce();
         releaseLocksOnce();
     }
 
     function onAbort() {
         teardown(abortError());
+    }
+
+    function wakeDemand() {
+        if (demandWaiters.length === 0) return;
+        const waiters = demandWaiters;
+        demandWaiters = [];
+        for (const resolve of waiters) resolve();
+    }
+
+    function flushAppQueue() {
+        while (
+            appReadableController &&
+            appQueue.length > 0 &&
+            appReadableController.desiredSize > 0
+        ) {
+            const chunk = appQueue.shift();
+            queuedAppBytes -= chunk.byteLength;
+            appReadableController.enqueue(chunk);
+        }
+    }
+
+    function enqueueAppData(appData) {
+        if (!appReadableController || closed) return;
+        flushAppQueue();
+        if (appQueue.length === 0 && appReadableController.desiredSize > 0) {
+            appReadableController.enqueue(appData);
+            return;
+        }
+        appQueue.push(appData);
+        queuedAppBytes += appData.byteLength;
+        if (queuedAppBytes > maxQueuedAppBytes) {
+            teardown(new Error(`wasmTls: decrypted data queue exceeded ${maxQueuedAppBytes} bytes`));
+        }
+    }
+
+    async function waitForAppBackpressure() {
+        while (
+            !closed &&
+            appQueue.length > 0 &&
+            appReadableController &&
+            appReadableController.desiredSize <= 0
+        ) {
+            await new Promise(resolve => demandWaiters.push(resolve));
+        }
     }
 
     /**
@@ -147,9 +208,13 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
             }
         },
         close() {
-            const err = settled ? null : new Error('wasmTls: app writable closed before TLS handshake completed');
-            try { appReadableController.close(); } catch (_) { /* noop */ }
-            teardown(err, { readableError: false });
+            if (!settled) {
+                teardown(new Error('wasmTls: app writable closed before TLS handshake completed'), {
+                    readableError: false,
+                });
+                return;
+            }
+            try { networkWriter.close().catch(() => { }); } catch (_) { /* noop */ }
         }
     });
 
@@ -182,6 +247,8 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
         async function networkPump() {
             try {
                 while (!closed) {
+                    await waitForAppBackpressure();
+                    if (closed) break;
                     const { done, value } = await networkReader.read();
                     if (done) {
                         const err = new Error('wasmTls: network closed before TLS handshake completed');
@@ -228,7 +295,8 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
                             // Read any decrypted application data
                             const appData = client.read_app_data();
                             if (appData && appData.length > 0) {
-                                appReadableController.enqueue(appData);
+                                enqueueAppData(appData);
+                                if (closed) return;
                             }
                         }
                     }

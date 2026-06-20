@@ -1,7 +1,7 @@
 /**
  * HTTP/2 fetch over SOCKS5 + Rustls WASM TLS.
  *
- * Multiplexed connection pool with RFC 9113 compliance hardening.
+ * Experimental single-stream HTTP/2 with RFC 9113 compliance hardening.
  *
  * @module proxy-fetch-http2
  * @license GPL-3.0-or-later
@@ -230,16 +230,48 @@ class Http2SingleConnection {
 
     createStreamState(streamId) {
         const body = new TransformStream();
-        return {
+        const stream = {
             streamId,
             headers: createDeferred(),
             headerSeen: false,
             contentLength: null,
             receivedBytes: 0,
-            bodyReadable: body.readable,
+            bodyReadable: null,
             bodyWriter: body.writable.getWriter(),
+            bodyReader: body.readable.getReader(),
             done: false,
         };
+        stream.bodyReadable = this.wrapBodyReadable(stream);
+        return stream;
+    }
+
+    wrapBodyReadable(stream) {
+        return new ReadableStream({
+            async pull(controller) {
+                const { done, value } = await stream.bodyReader.read();
+                if (done) {
+                    controller.close();
+                    return;
+                }
+                controller.enqueue(value);
+            },
+            cancel: async (reason) => {
+                const err = reason instanceof Error ? reason : new Error('HTTP/2 response body cancelled');
+                try { await stream.bodyReader.cancel(err); } catch (_) { /* noop */ }
+                await this.cancelStream(stream, err);
+            },
+        });
+    }
+
+    async cancelStream(stream, err) {
+        if (stream.done) return;
+        try {
+            await writeFrame(this.frameWriter, FRAME_RST_STREAM, 0, stream.streamId, uint32Payload(0x8));
+        } catch (_) {
+            // Socket may already be closed.
+        }
+        this.failStream(stream, err);
+        this.close(err);
     }
 
     async readLoop() {
@@ -263,7 +295,11 @@ class Http2SingleConnection {
             await this.handleControlFrame(frame);
             return;
         }
-        if (frame.type === FRAME_PRIORITY) return;
+        if (frame.type === FRAME_PRIORITY) {
+            if (frame.streamId === 0) throw new Error('HTTP/2: PRIORITY on stream 0');
+            if (frame.payload.byteLength !== 5) throw new Error('HTTP/2: malformed PRIORITY payload');
+            return;
+        }
         if (frame.type === FRAME_PUSH_PROMISE) {
             throw new Error('HTTP/2: PUSH_PROMISE is not supported');
         }
@@ -275,7 +311,11 @@ class Http2SingleConnection {
             return;
         }
         if (frame.streamId === 0) {
-            throw new Error(`HTTP/2: ${frame.type === FRAME_DATA ? 'DATA' : 'HEADERS'} on stream 0`);
+            const name = frame.type === FRAME_DATA ? 'DATA' : (frame.type === FRAME_HEADERS ? 'HEADERS' : 'RST_STREAM');
+            throw new Error(`HTTP/2: ${name} on stream 0`);
+        }
+        if (frame.type === FRAME_RST_STREAM && frame.payload.byteLength !== 4) {
+            throw new Error('HTTP/2: malformed RST_STREAM payload');
         }
 
         const stream = this.streams.get(frame.streamId);
@@ -345,7 +385,9 @@ class Http2SingleConnection {
             for (let i = 0; i < frame.payload.byteLength; i += 6) {
                 const id = readUint16(frame.payload, i);
                 const val = readUint32(frame.payload, i + 2);
-                if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
+                if (id === SETTINGS_ENABLE_PUSH && val !== 0 && val !== 1) {
+                    throw new Error('HTTP/2: invalid SETTINGS_ENABLE_PUSH');
+                } else if (id === 0x4) this.windowTracker.updateInitialWindowSize(val);
                 else if (id === 0x5) this.windowTracker.updateMaxFrameSize(val);
             }
             await writeFrame(this.frameWriter, FRAME_SETTINGS, FLAG_ACK, 0, new Uint8Array(0));
@@ -361,6 +403,9 @@ class Http2SingleConnection {
             return;
         }
         if (frame.type === FRAME_GOAWAY) {
+            if (frame.payload.byteLength < 8) {
+                throw new Error('HTTP/2: malformed GOAWAY payload');
+            }
             const errorCode = frame.payload.byteLength >= 8 ? readUint32(frame.payload, 4) : 0;
             throw new Error(`HTTP/2: peer sent GOAWAY (${errorCode})`);
         }
@@ -372,6 +417,7 @@ class Http2SingleConnection {
         }
         const increment = readUint31(frame.payload, 0);
         if (increment === 0) throw new Error('HTTP/2: WINDOW_UPDATE increment of 0 is PROTOCOL_ERROR');
+        if (frame.streamId !== 0 && !this.streams.has(frame.streamId)) return;
         this.windowTracker.addCredits(frame.streamId, increment);
     }
 
@@ -401,13 +447,16 @@ class Http2SingleConnection {
 
     finishStream(stream) {
         if (stream.done) return;
-        stream.done = true;
         if (stream.contentLength !== null && stream.receivedBytes !== stream.contentLength) {
-            this.failStream(stream, new Error('HTTP/2 response body truncated'));
+            this.failStream(stream, new Error(
+                `HTTP/2 response body truncated: expected ${stream.contentLength}, received ${stream.receivedBytes}`
+            ));
             return;
         }
+        stream.done = true;
         try { stream.bodyWriter.close(); } catch (_) { /* noop */ }
         this.streams.delete(stream.streamId);
+        this.windowTracker.streamWindows.delete(stream.streamId);
         if (this.streams.size === 0) this.close();
     }
 
@@ -417,15 +466,16 @@ class Http2SingleConnection {
         stream.headers.reject(err);
         try { stream.bodyWriter.abort(err); } catch (_) { /* noop */ }
         this.streams.delete(stream.streamId);
+        this.windowTracker.streamWindows.delete(stream.streamId);
     }
 
-    close(reason) {
+    close(reason = null) {
         if (this.closed) return;
         this.closed = true;
         const err = reason instanceof Error ? reason : new Error('HTTP/2 connection closed');
         if (this.signal && this.abortHandler) this.signal.removeEventListener('abort', this.abortHandler);
         this.windowTracker.close(err);
-        for (const stream of this.streams.values()) this.failStream(stream, err);
+        for (const stream of Array.from(this.streams.values())) this.failStream(stream, err);
         try { this.frameReader.cancel(err); } catch (_) { /* noop */ }
         try { this.frameReader.releaseLock(); } catch (_) { /* noop */ }
         try { this.frameWriter.abort(err).catch(() => { }); } catch (_) { /* noop */ }
@@ -1289,6 +1339,15 @@ function readUint31(buf, offset) {
 
 function readUint32(buf, offset) {
     return (buf[offset] * 0x1000000) + (buf[offset + 1] << 16) + (buf[offset + 2] << 8) + buf[offset + 3];
+}
+
+function uint32Payload(value) {
+    const payload = new Uint8Array(4);
+    payload[0] = (value >>> 24) & 0xff;
+    payload[1] = (value >>> 16) & 0xff;
+    payload[2] = (value >>> 8) & 0xff;
+    payload[3] = value & 0xff;
+    return payload;
 }
 
 async function sendWindowUpdate(writer, streamId, increment) {
