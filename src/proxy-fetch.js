@@ -606,6 +606,7 @@ async function writeHttp11Body(writer, bodyMode, signal) {
             await writer.write(chunk);
             await writer.write(textEncoder.encode('\r\n'));
         }
+        throwIfAborted(signal);
         await writer.write(textEncoder.encode('0\r\n\r\n'));
     } finally {
         if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);

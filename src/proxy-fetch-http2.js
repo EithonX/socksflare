@@ -572,7 +572,6 @@ class WindowTracker {
     constructor(initialWindowSize = 65535, maxFrameSize = DEFAULT_MAX_FRAME_SIZE) {
         this.connectionWindow = initialWindowSize;
         this.streamWindows = new Map();
-        this.streamWindows.set(1, initialWindowSize);
         this.initialWindowSize = initialWindowSize;
         this.maxFrameSize = maxFrameSize;
         this.waiters = [];

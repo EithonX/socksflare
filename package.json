@@ -4,6 +4,9 @@
   "description": "SOCKS5 proxy client for Cloudflare Workers with TLS via Rustls WASM",
   "type": "module",
   "main": "src/index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
   "exports": {
     ".": "./src/index.js"
   },
@@ -13,6 +16,7 @@
     "rust-tls-wasm/src/",
     "rust-tls-wasm/Cargo.toml",
     "rust-tls-wasm/Cargo.lock",
+    "tests/",
     "LICENSE",
     "README.md"
   ],
