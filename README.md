@@ -1,5 +1,7 @@
 # Socksflare
 
+[![CI](https://github.com/EithonX/socksflare/actions/workflows/ci.yml/badge.svg)](https://github.com/EithonX/socksflare/actions/workflows/ci.yml)
+
 **SOCKS5 proxy client for Cloudflare Workers with TLS via Rustls WASM.**
 
 Route HTTP(S) requests through a SOCKS5 proxy from the Cloudflare Edge — no external relay, no `startTls()`, no JS TLS fallback. TLS is handled entirely by [Rustls](https://github.com/rustls/rustls) compiled to WebAssembly: memory-safe, constant-time, production-grade.
