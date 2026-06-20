@@ -23,6 +23,26 @@ Cloudflare Workers' `startTls()` enforces domain-fronting restrictions on the Ed
 npm install socksflare
 ```
 
+## TypeScript
+
+Socksflare ships with TypeScript declarations:
+
+```ts
+import { Socks5Client, type SocksflareFetchOptions } from 'socksflare';
+
+const proxy = new Socks5Client({
+  host: '127.0.0.1',
+  port: 1080,
+});
+
+const options: SocksflareFetchOptions = {
+  httpVersion: '1.1',
+  timeoutMs: 15000,
+};
+
+const res = await proxy.fetch('https://example.com', {}, options);
+```
+
 ## Testing
 
 ```bash

@@ -4,6 +4,7 @@
   "description": "SOCKS5 proxy client for Cloudflare Workers with TLS via Rustls WASM",
   "type": "module",
   "main": "src/index.js",
+  "types": "./index.d.ts",
   "scripts": {
     "check": "node scripts/check-syntax.mjs",
     "test": "node --test tests/*.test.mjs",
@@ -23,7 +24,8 @@
     "rust-tls-wasm/Cargo.lock",
     "tests/",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "index.d.ts"
   ],
   "author": {
     "name": "EithonX",
