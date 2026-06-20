@@ -11,10 +11,15 @@
     "test:unit": "node --test tests/protocol.test.mjs",
     "test:integration": "node --test tests/integration.test.mjs",
     "pack:dry": "npm pack --dry-run",
+    "release:check": "npm run check && npm run test:unit && npm run test:integration && npm test && npm run pack:dry",
     "prepublishOnly": "npm run check && npm test && npm run pack:dry"
   },
   "exports": {
-    ".": "./src/index.js"
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
   },
   "files": [
     "src/",

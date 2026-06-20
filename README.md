@@ -186,12 +186,21 @@ wasm-pack build --target web
 
 ```
 socksflare/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
+├── scripts/
+│   └── check-syntax.mjs
 ├── src/
 │   ├── index.js             ← Main export: Socks5Client class
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
 │   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
 │   ├── proxy-fetch-http2.js ← Experimental single-stream HTTP/2 path
 │   └── wasm-tls.js          ← JS bridge to Rustls WASM
+├── tests/
+│   ├── protocol.test.mjs    ← Protocol/unit coverage
+│   ├── integration.test.mjs ← Local SOCKS5 + HTTP integration harness
+│   └── types-smoke.test.mjs ← Package metadata smoke coverage
 ├── rust-tls-wasm/
 │   ├── src/lib.rs           ← Rustls WasmTlsClient
 │   ├── Cargo.toml           ← rustls 0.23, ring 0.17, wasm-bindgen 0.2
@@ -199,6 +208,7 @@ socksflare/
 │   └── pkg/                 ← Pre-built WASM output (committed)
 ├── example/
 │   └── worker.js            ← Demo worker
+├── index.d.ts
 ├── package.json
 ├── LICENSE                  ← GPL-3.0-or-later
 └── README.md
