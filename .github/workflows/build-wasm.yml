@@ -2,20 +2,6 @@ name: Build WASM pkg
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - rust-tls-wasm/**
-      - .github/workflows/build-wasm.yml
-      - scripts/check-wasm-api.mjs
-      - package.json
-      - package-lock.json
-  pull_request:
-    paths:
-      - rust-tls-wasm/**
-      - .github/workflows/build-wasm.yml
-      - scripts/check-wasm-api.mjs
-      - package.json
-      - package-lock.json
 
 jobs:
   build-wasm:
