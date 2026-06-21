@@ -4,14 +4,16 @@ import { test } from 'node:test';
 
 const encoder = new TextEncoder();
 
-function loadSource(file, names) {
+function loadSource(file, names, scope = {}) {
   let source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
   source = source
     .replace(/^import .*?;\r?\n/gm, '')
     .replace(/\bexport\s+(?=(async\s+)?function|class|const|let|var)/g, '')
     .replace(/^export\s*\{[^}]+\};?\r?\n/gm, '');
 
-  return Function(`${source}\nreturn { ${names.join(', ')} };`)();
+  const params = Object.keys(scope);
+  const values = Object.values(scope);
+  return Function(...params, `${source}\nreturn { ${names.join(', ')} };`)(...values);
 }
 
 const http1 = loadSource('proxy-fetch.js', [
@@ -25,6 +27,7 @@ const http1 = loadSource('proxy-fetch.js', [
 ]);
 
 const h2 = loadSource('proxy-fetch-http2.js', [
+  'proxyFetchHttp2',
   'Http2SingleConnection',
   'H2FrameReader',
   'HpackDecoder',
@@ -44,10 +47,16 @@ const h2 = loadSource('proxy-fetch-http2.js', [
   'FLAG_END_HEADERS',
   'FLAG_END_STREAM',
   'FLAG_ACK',
+  'FLAG_PADDED',
 ]);
 
 const tls = loadSource('wasm-tls.js', [
   'advanceRustlsNetworkOffset',
+]);
+
+const socksApi = loadSource('socks5-client.js', [
+  'BufferedReader',
+  'socks5Connect',
 ]);
 
 const indexApi = loadSource('index.js', [
@@ -233,6 +242,51 @@ function h2Frame(type, flags, streamId, payload) {
   return out;
 }
 
+function windowUpdateIncrement(frame) {
+  return ((frame[9] & 0x7f) << 24) | (frame[10] << 16) | (frame[11] << 8) | frame[12];
+}
+
+function createMockSocksSocket(readSteps, options = {}) {
+  const writes = [];
+  let closeCount = 0;
+  const reader = readerFromSteps(readSteps);
+  const writer = {
+    write(chunk) {
+      writes.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+      return Promise.resolve();
+    },
+    releaseLock() {},
+  };
+
+  const socket = {
+    opened: options.openedError
+      ? Promise.reject(options.openedError)
+      : Promise.resolve(),
+    readable: {
+      getReader() {
+        return reader;
+      },
+    },
+    writable: {
+      getWriter() {
+        return writer;
+      },
+    },
+    close() {
+      closeCount += 1;
+      return Promise.resolve();
+    },
+  };
+
+  return {
+    socket,
+    writes,
+    get closeCount() {
+      return closeCount;
+    },
+  };
+}
+
 test('HTTP/1.1 Content-Length body succeeds exactly', async () => {
   const socket = fakeSocket();
   const stream = http1.createContentLengthStream(
@@ -300,6 +354,49 @@ test('HTTP/1.1 parser skips informational responses', async () => {
   const res = await http1.parseResponseBinary(readable, fakeSocket(), null);
   assert.equal(res.status, 200);
   assert.equal(await res.text(), 'ok');
+});
+
+test('HTTP/1.1 chunked Transfer-Encoding strips stale Content-Length from returned headers', async () => {
+  const readable = streamFromChunks([
+    'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 999\r\n\r\n5\r\nhello\r\n0\r\n\r\n',
+  ]);
+  const res = await http1.parseResponseBinary(readable, fakeSocket(), null);
+  assert.equal(await res.text(), 'hello');
+  assert.equal(res.headers.has('transfer-encoding'), false);
+  assert.equal(res.headers.has('content-length'), false);
+});
+
+test('HTTP/1.1 unsupported Transfer-Encoding gzip rejects', async () => {
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nhello']),
+      fakeSocket(),
+      null,
+    ),
+    /Unsupported Transfer-Encoding: gzip/,
+  );
+});
+
+test('HTTP/1.1 invalid Transfer-Encoding chunked, gzip rejects', async () => {
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhello']),
+      fakeSocket(),
+      null,
+    ),
+    /Unsupported Transfer-Encoding: chunked, gzip/,
+  );
+});
+
+test('HTTP/1.1 invalid Transfer-Encoding gzip, chunked rejects', async () => {
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\nhello']),
+      fakeSocket(),
+      null,
+    ),
+    /Unsupported Transfer-Encoding: gzip, chunked/,
+  );
 });
 
 test('proxyFetch rejects unsupported protocols before dialing', async () => {
@@ -444,6 +541,133 @@ test('HTTP/1.1 rejects GET request body before dialing', async () => {
     assert.equal(dialed, false);
   } finally {
     globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('SOCKS5 rejects unsupported selected auth method 0x01', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x01),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80),
+      /unsupported auth method selected: 0x01/,
+    );
+    assert.equal(mock.writes.length, 1);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 rejects unsupported selected auth method 0x7f', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x7f),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80),
+      /unsupported auth method selected: 0x7f/,
+    );
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 rejects bad username/password auth response version', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x02),
+    Uint8Array.of(0x02, 0x00),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect(
+        { hostname: 'proxy.test', port: 1080, username: 'user', password: 'pass' },
+        'example.com',
+        80,
+      ),
+      /bad auth response version: 2/,
+    );
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 rejects CONNECT reply with non-zero reserved byte', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x00),
+    Uint8Array.of(0x05, 0x00, 0x01, 0x01),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80),
+      /bad reserved byte in reply: 1/,
+    );
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 cleans up if socket.opened rejects before handshake starts', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const openedError = new Error('open failed');
+  const mock = createMockSocksSocket([], { openedError });
+  const ac = new AbortController();
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80, {
+        signal: ac.signal,
+      }),
+      /open failed/,
+    );
+    assert.equal(mock.closeCount, 1);
+    ac.abort(new Error('later abort'));
+    assert.equal(mock.closeCount, 1);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
   }
 });
 
@@ -873,6 +1097,84 @@ test('HTTP/2 rejects HEAD request body before sending request', async () => {
   );
 });
 
+test('HTTP/2 top-level GET with body rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      h2.proxyFetchHttp2(new URL('https://example.com/'), { method: 'GET', body: 'x' }, {}),
+      /HTTP\/2: GET requests cannot have a body/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/2 top-level HEAD with body rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      h2.proxyFetchHttp2(new URL('https://example.com/'), { method: 'HEAD', body: 'x' }, {}),
+      /HTTP\/2: HEAD requests cannot have a body/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/2 FormData rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    const form = new FormData();
+    form.set('x', '1');
+    await assert.rejects(
+      h2.proxyFetchHttp2(new URL('https://example.com/'), { method: 'POST', body: form }, {}),
+      /FormData request bodies are not supported yet/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/2 unsupported body object rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      h2.proxyFetchHttp2(new URL('https://example.com/'), { method: 'POST', body: { nope: true } }, {}),
+      /Unsupported request body type/,
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
 test('HTTP/2 invalid request header name rejects', () => {
   const fakeUrl = new URL('https://example.com/');
   const bodyMode = { kind: 'none' };
@@ -1016,6 +1318,7 @@ test('HTTP/1.1 invalid request header name rejects', () => {
     () => http1.buildHttpRequest(
       new URL('http://example.com/'),
       { headers: { 'bad header!': 'value' } },
+      'GET',
       { kind: 'none' },
     ),
     /invalid header name/,
@@ -1027,10 +1330,22 @@ test('HTTP/1.1 request header value with CR/LF rejects', () => {
     () => http1.buildHttpRequest(
       new URL('http://example.com/'),
       { headers: { 'x-test': 'val\r\ninjected' } },
+      'GET',
       { kind: 'none' },
     ),
     /invalid header value/,
   );
+});
+
+test('HTTP/1.1 allows RFC token request method such as M-SEARCH', () => {
+  const req = http1.buildHttpRequest(
+    new URL('http://example.com/'),
+    {},
+    'M-SEARCH',
+    { kind: 'none' },
+  );
+
+  assert.match(new TextDecoder().decode(req), /^M-SEARCH \/ HTTP\/1\.1/);
 });
 
 test('HTTP/2 fetch returns null body for 204 without END_STREAM on HEADERS', async () => {
@@ -1227,6 +1542,135 @@ test('HTTP/2 sends WINDOW_UPDATE after body writer resolves', async () => {
   assert.equal(writes.some(frame => frame[3] === h2.FRAME_WINDOW_UPDATE), true);
 });
 
+test('HTTP/2 padded DATA refunds full flow-controlled length', async () => {
+  const { conn, writes } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+  stream.headerSeen = true;
+  stream.headers.resolve({ meta: {}, endStream: false });
+
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_PADDED | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: Uint8Array.of(2, 0x6f, 0x6b, 0x00, 0x00),
+  });
+
+  const updates = writes.filter(frame => frame[3] === h2.FRAME_WINDOW_UPDATE);
+  assert.equal(updates.length, 2);
+  assert.deepEqual(updates.map(windowUpdateIncrement), [5, 5]);
+});
+
+test('HTTP/2 null-body padded DATA with zero app data still refunds flow-control credit', async () => {
+  const { conn, writes } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'HEAD';
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200']]),
+  });
+  await stream.headers.promise;
+
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_PADDED | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: Uint8Array.of(2, 0x00, 0x00),
+  });
+
+  const updates = writes.filter(frame => frame[3] === h2.FRAME_WINDOW_UPDATE);
+  assert.equal(updates.length, 2);
+  assert.deepEqual(updates.map(windowUpdateIncrement), [3, 3]);
+});
+
+test('HTTP/2 rejects DATA after trailers', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200']]),
+  });
+  await stream.headers.promise;
+
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_HEADERS,
+      flags: h2.FLAG_END_HEADERS,
+      streamId: 1,
+      payload: h2HeaderBlock([['etag', 'abc']]),
+    }),
+    /trailing HEADERS must set END_STREAM/,
+  );
+});
+
+test('HTTP/2 trailers with pseudo-header reject', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200']]),
+  });
+  await stream.headers.promise;
+
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_HEADERS,
+      flags: h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+      streamId: 1,
+      payload: h2HeaderBlock([[':status', '204']]),
+    }),
+    /pseudo-header in trailers/,
+  );
+});
+
+test('HTTP/2 DATA after valid trailers rejects', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200']]),
+  });
+  await stream.headers.promise;
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS | h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: h2HeaderBlock([['etag', 'abc']]),
+  });
+
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_DATA,
+      flags: 0,
+      streamId: 1,
+      payload: bytes('x'),
+    }),
+    /DATA after trailers/,
+  );
+});
+
 test('wasmTls rejects zero-byte Rustls consumption from non-empty network chunk', () => {
   const client = {
     provide_network_data() {
@@ -1237,5 +1681,112 @@ test('wasmTls rejects zero-byte Rustls consumption from non-empty network chunk'
   assert.throws(
     () => tls.advanceRustlsNetworkOffset(client, bytes('abc'), 0),
     /Rustls consumed 0 bytes from non-empty network data/,
+  );
+});
+
+test('wasmTls forwards extra roots and enforces queued decrypted byte cap', async () => {
+  let seenExtraRoots;
+  class FakeTlsClient {
+    constructor(_hostname, _alpnCsv, extraRoots) {
+      seenExtraRoots = extraRoots;
+      this.appChunks = [bytes('abcdef')];
+    }
+    free() {}
+    wants_write() { return false; }
+    extract_network_data() { return new Uint8Array(0); }
+    provide_network_data(chunk) { return chunk.byteLength; }
+    is_handshaking() { return false; }
+    negotiatedAlpn() { return 'h2'; }
+    read_app_data() { return this.appChunks.shift() ?? new Uint8Array(0); }
+    write_app_data() {}
+  }
+
+  const tlsModule = loadSource('wasm-tls.js', ['wasmTlsHandshake'], {
+    initSync() {},
+    WasmTlsClient: FakeTlsClient,
+    wasmModule: {},
+  });
+
+  const tunnel = await tlsModule.wasmTlsHandshake(
+    streamFromChunks([bytes('record')]),
+    new WritableStream({ write() {} }),
+    'localhost',
+    {
+      extraRootCertificates: [new Uint8Array([1, 2, 3])],
+      maxQueuedAppBytes: 4,
+    },
+  );
+
+  assert.equal(seenExtraRoots.length, 1);
+  assert.deepEqual(Array.from(seenExtraRoots[0]), [1, 2, 3]);
+
+  await assert.rejects(
+    withTimeout(tunnel.readable.getReader().read()),
+    /decrypted data queue exceeded 4 bytes/,
+  );
+});
+
+test('wasmTls pauses network pump until app demand resumes', async () => {
+  let provideCalls = 0;
+  class FakeTlsClient {
+    constructor() {
+      this.appChunks = [bytes('first'), bytes('second')];
+    }
+    free() {}
+    wants_write() { return false; }
+    extract_network_data() { return new Uint8Array(0); }
+    provide_network_data(chunk) {
+      provideCalls += 1;
+      return chunk.byteLength;
+    }
+    is_handshaking() { return false; }
+    negotiatedAlpn() { return null; }
+    read_app_data() { return this.appChunks.shift() ?? new Uint8Array(0); }
+    write_app_data() {}
+  }
+
+  const tlsModule = loadSource('wasm-tls.js', ['wasmTlsHandshake'], {
+    initSync() {},
+    WasmTlsClient: FakeTlsClient,
+    wasmModule: {},
+  });
+
+  const tunnel = await tlsModule.wasmTlsHandshake(
+    streamFromChunks([bytes('record-1'), bytes('record-2')]),
+    new WritableStream({ write() {} }),
+    'localhost',
+  );
+
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(provideCalls, 1);
+
+  const reader = tunnel.readable.getReader();
+  const first = await withTimeout(reader.read());
+  assert.equal(new TextDecoder().decode(first.value), 'first');
+
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(provideCalls, 2);
+
+  const second = await withTimeout(reader.read());
+  assert.equal(new TextDecoder().decode(second.value), 'second');
+});
+
+test('wasmTls rejects extraRootCertificates when pkg artifact is stale', async () => {
+  function LegacyWasmTlsClient() {}
+
+  const tlsModule = loadSource('wasm-tls.js', ['wasmTlsHandshake'], {
+    initSync() {},
+    WasmTlsClient: LegacyWasmTlsClient,
+    wasmModule: {},
+  });
+
+  await assert.rejects(
+    tlsModule.wasmTlsHandshake(
+      streamFromChunks([]),
+      new WritableStream({ write() {} }),
+      'localhost',
+      { extraRootCertificates: [new Uint8Array([1, 2, 3])] },
+    ),
+    /requires a rebuilt rust-tls-wasm\/pkg artifact/,
   );
 });

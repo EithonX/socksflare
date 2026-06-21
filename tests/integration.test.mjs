@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createServer as createHttpServer } from 'node:http';
+import { createServer as createHttpsServer } from 'node:https';
+import { createSecureServer as createHttp2SecureServer } from 'node:http2';
 import net from 'node:net';
 import { Duplex } from 'node:stream';
 import { test } from 'node:test';
+import { localhostCertDer, localhostCertPem, localhostKeyPem } from './fixtures/localhost-tls.mjs';
+import tls from 'node:tls';
 
 function loadSource(file, names, scope = {}) {
   let source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
@@ -80,18 +84,79 @@ function nodeConnect({ hostname, port }) {
   };
 }
 
+function derToPem(der) {
+  const base64 = Buffer.from(der).toString('base64').match(/.{1,64}/g)?.join('\n') || '';
+  return `-----BEGIN CERTIFICATE-----\n${base64}\n-----END CERTIFICATE-----\n`;
+}
+
+// Integration tests exercise real TLS + ALPN over the SOCKS tunnel in Node.
+// The repo snapshot used here does not include a Rust/WASM toolchain, so end-to-end
+// Rustls WASM regeneration remains a documented follow-up outside this test harness.
+async function nodeTlsHandshake(networkReadable, networkWritable, tlsHostname, options = {}) {
+  const rawSocket = Duplex.fromWeb({
+    readable: networkReadable,
+    writable: networkWritable,
+  });
+  const signal = options.signal;
+  const ca = Array.isArray(options.extraRootCertificates)
+    ? options.extraRootCertificates.map(cert => derToPem(cert))
+    : undefined;
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect({
+      socket: rawSocket,
+      servername: tlsHostname,
+      ALPNProtocols: options.alpnProtocols,
+      ca,
+      rejectUnauthorized: true,
+    });
+
+    const abort = () => {
+      const err = signal?.reason instanceof Error ? signal.reason : new Error('Aborted');
+      socket.destroy(err);
+    };
+    const cleanup = () => {
+      socket.off('secureConnect', onSecureConnect);
+      socket.off('error', onError);
+      if (signal) signal.removeEventListener('abort', abort);
+    };
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const onSecureConnect = () => {
+      cleanup();
+      const webSocket = Duplex.toWeb(socket);
+      resolve({
+        readable: webSocket.readable,
+        writable: webSocket.writable,
+        alpnProtocol: socket.alpnProtocol || null,
+      });
+    };
+
+    if (signal?.aborted) {
+      abort();
+      return;
+    }
+
+    socket.once('error', onError);
+    socket.once('secureConnect', onSecureConnect);
+    if (signal) signal.addEventListener('abort', abort, { once: true });
+  });
+}
+
 const { socks5Connect } = loadSource('socks5-client.js', ['socks5Connect'], {
   connect: nodeConnect,
-  wasmTlsHandshake: async () => {
-    throw new Error('TLS integration TODO: local HTTP harness only in this phase');
-  },
+  wasmTlsHandshake: nodeTlsHandshake,
+});
+
+const { proxyFetchHttp2 } = loadSource('proxy-fetch-http2.js', ['proxyFetchHttp2'], {
+  socks5Connect,
 });
 
 const { proxyFetch } = loadSource('proxy-fetch.js', ['proxyFetch'], {
   socks5Connect,
-  proxyFetchHttp2: async () => {
-    throw new Error('HTTP/2 integration TODO: local HTTP harness only in this phase');
-  },
+  proxyFetchHttp2,
 });
 
 class SocketReader {
@@ -348,6 +413,170 @@ async function startHttpOrigin() {
   };
 }
 
+function handleTlsOriginRequest(req, res, originLabel) {
+  const url = new URL(req.url, 'https://localhost');
+
+  if (url.pathname === '/hello') {
+    const body = `hello via ${originLabel}!`;
+    res.writeHead(200, {
+      'content-type': 'text/plain',
+      'x-origin': originLabel,
+      'content-length': String(Buffer.byteLength(body)),
+    });
+    res.end(body);
+    return;
+  }
+
+  if (url.pathname === '/echo' && req.method === 'POST') {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      res.writeHead(201, {
+        'content-type': 'application/octet-stream',
+        'x-origin': originLabel,
+        'content-length': String(body.length),
+      });
+      res.end(body);
+    });
+    return;
+  }
+
+  res.writeHead(404, {
+    'content-type': 'text/plain',
+    'content-length': '9',
+  });
+  res.end('not found');
+}
+
+async function startHttpsOrigin() {
+  const sockets = new Set();
+  const server = createHttpsServer(
+    {
+      key: localhostKeyPem,
+      cert: localhostCertPem,
+      ALPNProtocols: ['http/1.1'],
+    },
+    (req, res) => handleTlsOriginRequest(req, res, 'local-https'),
+  );
+
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to bind local HTTPS origin');
+  }
+
+  return {
+    port: address.port,
+    url(path) {
+      return `https://localhost:${address.port}${path}`;
+    },
+    async close() {
+      for (const socket of Array.from(sockets)) socket.destroy();
+      await new Promise(resolve => server.close(() => resolve()));
+    },
+  };
+}
+
+async function startHttp2Origin() {
+  const sockets = new Set();
+  const sessions = new Set();
+  const server = createHttp2SecureServer({
+    key: localhostKeyPem,
+    cert: localhostCertPem,
+    allowHTTP1: false,
+    ALPNProtocols: ['h2'],
+  });
+
+  server.on('connection', socket => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+
+  server.on('session', session => {
+    sessions.add(session);
+    session.on('close', () => sessions.delete(session));
+    session.on('error', () => {});
+  });
+
+  server.on('stream', (stream, headers) => {
+    const path = headers[':path'] || '/';
+    const method = headers[':method'] || 'GET';
+
+    if (path === '/hello') {
+      const body = 'hello via local-h2!';
+      stream.respond({
+        ':status': 200,
+        'content-type': 'text/plain',
+        'x-origin': 'local-h2',
+        'content-length': String(Buffer.byteLength(body)),
+      });
+      stream.end(body);
+      return;
+    }
+
+    if (path === '/echo' && method === 'POST') {
+      const chunks = [];
+      stream.on('data', chunk => chunks.push(chunk));
+      stream.on('end', () => {
+        const body = Buffer.concat(chunks);
+        stream.respond({
+          ':status': 201,
+          'content-type': 'application/octet-stream',
+          'x-origin': 'local-h2',
+          'content-length': String(body.length),
+        });
+        stream.end(body);
+      });
+      return;
+    }
+
+    stream.respond({
+      ':status': 404,
+      'content-type': 'text/plain',
+      'content-length': '9',
+    });
+    stream.end('not found');
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      server.off('error', reject);
+      resolve();
+    });
+  });
+
+  const address = server.address();
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to bind local HTTP/2 origin');
+  }
+
+  return {
+    port: address.port,
+    url(path) {
+      return `https://localhost:${address.port}${path}`;
+    },
+    async close() {
+      for (const session of Array.from(sessions)) session.destroy();
+      for (const socket of Array.from(sockets)) socket.destroy();
+      await new Promise(resolve => server.close(() => resolve()));
+    },
+  };
+}
+
 async function startSocksServer() {
   const sockets = new Set();
   const tunnels = [];
@@ -521,6 +750,51 @@ async function createHarness() {
   };
 }
 
+async function createTlsHarness() {
+  const socks = await startSocksServer();
+  const httpsOrigin = await startHttpsOrigin();
+  const http2Origin = await startHttp2Origin();
+
+  return {
+    socks,
+    httpsOrigin,
+    http2Origin,
+    extraRootCertificates: [localhostCertDer],
+    proxyConfig: {
+      hostname: '127.0.0.1',
+      port: socks.port,
+    },
+    async close() {
+      await Promise.allSettled([
+        socks.close(),
+        httpsOrigin.close(),
+        http2Origin.close(),
+      ]);
+    },
+  };
+}
+
+async function readAllBytes(readable) {
+  const reader = readable.getReader();
+  const chunks = [];
+  let total = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    total += value.byteLength;
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 test('proxyFetch fetches local HTTP/1.1 origin through SOCKS5 domain tunnel', async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
@@ -653,4 +927,106 @@ test('proxyFetch abort during response body closes SOCKS5 tunnel', async (t) => 
   );
   await withTimeout(tunnel.closed);
   await withTimeout(originClose.promise);
+});
+
+test('socks5Connect TLS tunnel reaches local HTTPS origin with extra roots', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const tunnel = await socks5Connect(
+    harness.proxyConfig,
+    'localhost',
+    harness.httpsOrigin.port,
+    {
+      enableTls: true,
+      tlsHostname: 'localhost',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  const writer = tunnel.writable.getWriter();
+  await writer.write(new TextEncoder().encode(
+    `GET /hello HTTP/1.1\r\nHost: localhost:${harness.httpsOrigin.port}\r\nConnection: close\r\n\r\n`,
+  ));
+  writer.releaseLock();
+
+  const response = new TextDecoder().decode(await readAllBytes(tunnel.readable));
+  assert.match(response, /^HTTP\/1\.1 200 OK/m);
+  assert.match(response, /hello via local-https!/);
+});
+
+test('proxyFetch HTTPS HTTP/1.1 works against local TLS origin', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const res = await proxyFetch(
+    harness.httpsOrigin.url('/hello'),
+    {},
+    harness.proxyConfig,
+    {
+      httpVersion: '1.1',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-origin'), 'local-https');
+  assert.equal(await res.text(), 'hello via local-https!');
+});
+
+test('proxyFetch HTTPS HTTP/2 works against local H2 TLS origin', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const res = await proxyFetch(
+    harness.http2Origin.url('/hello'),
+    {},
+    harness.proxyConfig,
+    {
+      httpVersion: '2',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-origin'), 'local-h2');
+  assert.equal(await res.text(), 'hello via local-h2!');
+});
+
+test('proxyFetch HTTPS auto negotiates HTTP/2 when ALPN offers h2', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const res = await proxyFetch(
+    harness.http2Origin.url('/hello'),
+    {},
+    harness.proxyConfig,
+    {
+      httpVersion: 'auto',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-origin'), 'local-h2');
+  assert.equal(await res.text(), 'hello via local-h2!');
+});
+
+test('proxyFetch HTTPS auto falls back to HTTP/1.1 when ALPN does not negotiate h2', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const res = await proxyFetch(
+    harness.httpsOrigin.url('/hello'),
+    {},
+    harness.proxyConfig,
+    {
+      httpVersion: 'auto',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get('x-origin'), 'local-https');
+  assert.equal(await res.text(), 'hello via local-https!');
 });
