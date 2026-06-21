@@ -12,9 +12,10 @@
     "test": "node --test tests/protocol.test.mjs tests/integration.test.mjs tests/types-smoke.test.mjs",
     "test:unit": "node --test tests/protocol.test.mjs",
     "test:integration": "node --test tests/integration.test.mjs",
+    "test:package": "node --test tests/package-smoke.test.mjs",
     "pack:dry": "npm pack --dry-run",
-    "release:check": "npm run check && npm run check:wasm-api && npm run test:unit && npm run test:integration && npm test && npm run pack:dry",
-    "prepublishOnly": "npm run check && npm run check:wasm-api && npm test && npm run pack:dry"
+    "release:check": "npm run check && npm run check:wasm-api && npm run test:unit && npm run test:integration && npm test && npm run test:package && npm run pack:dry",
+    "prepublishOnly": "npm run check && npm run check:wasm-api && npm test && npm run test:package && npm run pack:dry"
   },
   "exports": {
     ".": {
@@ -29,7 +30,7 @@
     "rust-tls-wasm/src/",
     "rust-tls-wasm/Cargo.toml",
     "rust-tls-wasm/Cargo.lock",
-    "tests/",
+    "example/",
     "LICENSE",
     "README.md",
     "index.d.ts"
