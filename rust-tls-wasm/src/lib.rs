@@ -1,8 +1,10 @@
-use wasm_bindgen::prelude::*;
+use js_sys::{Array, Uint8Array};
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
-use rustls_pki_types::ServerName;
-use std::sync::Arc;
+use rustls_pki_types::{CertificateDer, ServerName};
 use std::io::{Read, Write, Cursor};
+use std::sync::Arc;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 #[wasm_bindgen]
 pub struct WasmTlsClient {
@@ -12,9 +14,10 @@ pub struct WasmTlsClient {
 #[wasm_bindgen]
 impl WasmTlsClient {
     #[wasm_bindgen(constructor)]
-    pub fn new(hostname: &str, alpn_csv: Option<String>) -> Result<WasmTlsClient, JsValue> {
+    pub fn new(hostname: &str, alpn_csv: Option<String>, extra_roots: Option<Array>) -> Result<WasmTlsClient, JsValue> {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        add_extra_root_certificates(&mut root_store, extra_roots)?;
         
         let mut config = ClientConfig::builder()
             .with_root_certificates(root_store)
@@ -109,10 +112,38 @@ fn parse_alpn_protocols(alpn_csv: Option<String>) -> Result<Vec<Vec<u8>>, JsValu
             if !p.is_ascii() {
                 return Err(JsValue::from_str("ALPN protocol names must be ASCII"));
             }
+            if p.len() > 255 {
+                return Err(JsValue::from_str("ALPN protocol names must be <= 255 bytes"));
+            }
 
             parsed.push(p.as_bytes().to_vec());
         }
     }
 
     Ok(parsed)
+}
+
+fn add_extra_root_certificates(root_store: &mut RootCertStore, extra_roots: Option<Array>) -> Result<(), JsValue> {
+    let Some(extra_roots) = extra_roots else {
+        return Ok(());
+    };
+
+    for (index, value) in extra_roots.iter().enumerate() {
+        let bytes = value
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| JsValue::from_str(&format!(
+                "extraRootCertificates[{}] must be a Uint8Array",
+                index
+            )))?
+            .to_vec();
+
+        root_store
+            .add(CertificateDer::from(bytes))
+            .map_err(|e| JsValue::from_str(&format!(
+                "Invalid extra root certificate at index {}: {}",
+                index, e
+            )))?;
+    }
+
+    Ok(())
 }

@@ -233,6 +233,7 @@ function throwIfAborted(signal) {
  * @param {boolean} [options.enableTls=false] - Upgrade tunnel with TLS via Rustls WASM.
  * @param {string} [options.tlsHostname] - SNI hostname for TLS (defaults to targetHost).
  * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+ * @param {Array<ArrayBuffer|Uint8Array>} [options.extraRootCertificates] - Optional extra DER roots.
  * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
  */
 export async function socks5Connect(proxyConfig, targetHost, targetPort, options = {}) {
@@ -260,23 +261,39 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
   const enableTls = options.enableTls || false;
   const tlsHostname = options.tlsHostname || targetHost;
   const alpnProtocols = Array.isArray(options.alpnProtocols) ? options.alpnProtocols : undefined;
+  const extraRootCertificates = Array.isArray(options.extraRootCertificates)
+    ? options.extraRootCertificates
+    : undefined;
 
-  // Connect to SOCKS5 proxy over plain TCP — always unencrypted at this layer.
-  const socket = connect({ hostname: proxyHost, port: proxyPort });
-  const abortHandler = signal
-    ? () => {
-        try { socket.close(); } catch (_) { /* noop */ }
-      }
-    : null;
-  if (signal) signal.addEventListener('abort', abortHandler, { once: true });
-  await socket.opened;
-  throwIfAborted(signal);
+  let socket = null;
+  let writer = null;
+  let rawReader = null;
+  let reader = null;
+  let abortHandler = null;
 
-  const writer = socket.writable.getWriter();
-  const rawReader = socket.readable.getReader();
-  const reader = new BufferedReader(rawReader);
+  const removeAbortListener = () => {
+    if (signal && abortHandler) {
+      signal.removeEventListener('abort', abortHandler);
+      abortHandler = null;
+    }
+  };
 
   try {
+    // Connect to SOCKS5 proxy over plain TCP — always unencrypted at this layer.
+    socket = connect({ hostname: proxyHost, port: proxyPort });
+    abortHandler = signal
+      ? () => {
+          try { socket.close(); } catch (_) { /* noop */ }
+        }
+      : null;
+    if (signal) signal.addEventListener('abort', abortHandler, { once: true });
+    await socket.opened;
+    throwIfAborted(signal);
+
+    writer = socket.writable.getWriter();
+    rawReader = socket.readable.getReader();
+    reader = new BufferedReader(rawReader);
+
     // ── Method Negotiation ──
     const methodReq = useAuth
       ? new Uint8Array([SOCKS_VERSION, 2, AUTH_NONE, AUTH_USERPASS])
@@ -291,6 +308,9 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
     }
     if (methodResp[1] === AUTH_NO_ACCEPTABLE) {
       throw new Error('SOCKS5: no acceptable auth method');
+    }
+    if (methodResp[1] !== AUTH_NONE && methodResp[1] !== AUTH_USERPASS) {
+      throw new Error(`SOCKS5: unsupported auth method selected: 0x${methodResp[1].toString(16).padStart(2, '0')}`);
     }
 
     // ── Username/Password Authentication ──
@@ -319,6 +339,9 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
 
       const authResp = await reader.readExact(2);
       throwIfAborted(signal);
+      if (authResp[0] !== AUTH_USERPASS_VERSION) {
+        throw new Error(`SOCKS5: bad auth response version: ${authResp[0]}`);
+      }
       if (authResp[1] !== AUTH_USERPASS_SUCCESS) {
         throw new Error('SOCKS5: authentication failed');
       }
@@ -348,6 +371,9 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
       const msg = REPLY_MESSAGES[connResp[1]] || `unknown error (0x${connResp[1].toString(16)})`;
       throw new Error(`SOCKS5: ${msg}`);
     }
+    if (connResp[2] !== 0x00) {
+      throw new Error(`SOCKS5: bad reserved byte in reply: ${connResp[2]}`);
+    }
 
     // Consume bound address (variable-length, we don't need it)
     const boundAtyp = connResp[3];
@@ -370,20 +396,29 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
     if (enableTls) {
       const tlsTunnel = await wasmTlsHandshake(socket.readable, socket.writable, tlsHostname, {
         alpnProtocols,
+        extraRootCertificates,
         signal,
       });
-      if (signal) signal.removeEventListener('abort', abortHandler);
+      removeAbortListener();
       return { socket, ...tlsTunnel };
     }
 
-    if (signal) signal.removeEventListener('abort', abortHandler);
+    removeAbortListener();
     return { socket, readable: socket.readable, writable: socket.writable };
 
   } catch (err) {
-    if (signal) signal.removeEventListener('abort', abortHandler);
-    try { reader.releaseLock(); } catch (_) { /* already released */ }
-    try { writer.releaseLock(); } catch (_) { /* already released */ }
-    try { await socket.close(); } catch (_) { /* best-effort cleanup */ }
+    removeAbortListener();
+    if (reader) {
+      try { reader.releaseLock(); } catch (_) { /* already released */ }
+    } else if (rawReader) {
+      try { rawReader.releaseLock(); } catch (_) { /* already released */ }
+    }
+    if (writer) {
+      try { writer.releaseLock(); } catch (_) { /* already released */ }
+    }
+    if (socket) {
+      try { await socket.close(); } catch (_) { /* best-effort cleanup */ }
+    }
     throw err;
   }
 }

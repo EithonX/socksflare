@@ -33,6 +33,11 @@ export interface SocksflareFetchOptions {
    * Abort after this many milliseconds.
    */
   timeoutMs?: number;
+
+  /**
+   * Optional extra DER root certificates for advanced/local TLS testing.
+   */
+  extraRootCertificates?: Array<ArrayBuffer | Uint8Array>;
 }
 
 export interface SocksflareConnectOptions {
@@ -60,6 +65,11 @@ export interface SocksflareConnectOptions {
    * Abort after this many milliseconds.
    */
   timeoutMs?: number;
+
+  /**
+   * Optional extra DER root certificates for advanced/local TLS testing.
+   */
+  extraRootCertificates?: Array<ArrayBuffer | Uint8Array>;
 }
 
 export interface SocksflareTunnel {
@@ -87,7 +97,7 @@ export class Socks5Client {
 
 export function proxyFetch(
   input: string | URL | Request,
-  init: RequestInit | undefined,
+  init?: RequestInit,
   proxyConfig: Socks5LowLevelConfig,
   options?: SocksflareFetchOptions,
 ): Promise<Response>;

@@ -27,6 +27,7 @@ const MAX_HEADER_LINE_LENGTH = 8192;         // 8KB per header line
 const MAX_CHUNK_SIZE = 16 * 1024 * 1024;     // 16MB per chunked-TE chunk
 const MAX_CHUNK_LINE_LENGTH = 8192;          // 8KB chunk-size / trailer line cap
 const MAX_CONSECUTIVE_EMPTY_CHUNKS = 1024;
+const METHOD_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
@@ -74,6 +75,7 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
         try {
             return await proxyFetchHttp2(url, requestInit, proxyConfig, {
                 tlsHostname: options.tlsHostname,
+                extraRootCertificates: options.extraRootCertificates,
             });
         } catch (err) {
             if (requestedVersion === '2' || !shouldFallbackToHttp11(err)) {
@@ -95,7 +97,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     let abortHandler = null;
 
     throwIfAborted(signal);
-    const method = (requestInit.method || 'GET').toUpperCase();
+    const method = normalizeRequestMethod(requestInit.method, 'HTTP/1.1');
     const bodyMode = await normalizeHttp11Body(requestInit.body);
     assertMethodBodyAllowed(method, bodyMode, 'HTTP/1.1');
 
@@ -104,6 +106,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
         enableTls: isHttps,
         tlsHostname,
         alpnProtocols: isHttps ? ['http/1.1'] : undefined,
+        extraRootCertificates: options.extraRootCertificates,
         signal,
     });
     abortHandler = signal
@@ -116,7 +119,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     try {
         // Build and send raw HTTP/1.1 request
         throwIfAborted(signal);
-        const requestBytes = buildHttpRequest(url, requestInit, bodyMode);
+        const requestBytes = buildHttpRequest(url, requestInit, method, bodyMode);
         const writer = tunnel.writable.getWriter();
         try {
             await writer.write(requestBytes);
@@ -142,12 +145,8 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
 
 // ─── HTTP Request Builder ───────────────────────────────────────────
 
-function buildHttpRequest(url, init, bodyMode) {
+function buildHttpRequest(url, init, method, bodyMode) {
     // ── Build HTTP Request ──
-    const method = (init.method || 'GET').toUpperCase();
-    if (!/^[A-Z]+$/.test(method)) {
-        throw new Error(`Invalid HTTP method: ${method}`);
-    }
     const path = url.pathname + url.search;
     const host = url.port ? `${url.hostname}:${url.port}` : url.hostname;
     const headers = new Headers(init.headers);
@@ -340,15 +339,15 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
     }
 
     // ── Determine body strategy ──
-    const transferEncoding = responseHeaders.get('transfer-encoding');
-    const isChunked = transferEncoding && transferEncoding.toLowerCase().includes('chunked');
+    const transferEncoding = parseTransferEncoding(responseHeaders.get('transfer-encoding'));
     const contentLength = parseStrictContentLength(contentLengthValues);
 
     let bodyStream;
 
-    if (isChunked) {
+    if (transferEncoding === 'chunked') {
         bodyStream = createChunkedStream(reader, bodyRemainder, socket, signal, cleanupAbort);
         responseHeaders.delete('transfer-encoding');
+        responseHeaders.delete('content-length');
     } else if (contentLength !== null && contentLength >= 0) {
         bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket, signal, cleanupAbort);
     } else {
@@ -649,6 +648,14 @@ function shouldFallbackToHttp11(err) {
     return !!(err && err.code === HTTP2_NOT_NEGOTIATED_ERROR_CODE);
 }
 
+function normalizeRequestMethod(method, protocol) {
+    const normalized = String(method || 'GET').toUpperCase();
+    if (!METHOD_TOKEN_RE.test(normalized)) {
+        throw new Error(`${protocol}: invalid method: ${normalized}`);
+    }
+    return normalized;
+}
+
 function assertMethodBodyAllowed(method, bodyMode, protocol) {
     if ((method === 'GET' || method === 'HEAD') && bodyMode.kind !== 'none') {
         throw new Error(`${protocol}: ${method} requests cannot have a body`);
@@ -721,6 +728,32 @@ function parseStrictContentLength(values) {
         throw new Error(`Invalid Content-Length: ${first}`);
     }
     return n;
+}
+
+function parseTransferEncoding(value) {
+    if (value == null) return null;
+    const tokens = String(value)
+        .split(',')
+        .map(token => token.trim().toLowerCase());
+
+    if (tokens.length === 0 || tokens.some(token => token.length === 0)) {
+        throw new Error(`Unsupported Transfer-Encoding: ${value}`);
+    }
+
+    const finalCoding = tokens[tokens.length - 1];
+    if (finalCoding !== 'chunked') {
+        throw new Error(`Unsupported Transfer-Encoding: ${value}`);
+    }
+
+    for (let i = 0; i < tokens.length - 1; i++) {
+        const token = tokens[i];
+        if (token === 'chunked') {
+            throw new Error(`Unsupported Transfer-Encoding: ${value}`);
+        }
+        throw new Error(`Unsupported Transfer-Encoding: ${value}`);
+    }
+
+    return 'chunked';
 }
 
 function appendBuffer(a, b) {

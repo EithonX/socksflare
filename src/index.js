@@ -65,6 +65,7 @@ export class Socks5Client {
      * @param {Object} [options] - Additional options.
      * @param {string} [options.tlsHostname] - Override SNI hostname for TLS.
      * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
+     * @param {Array<ArrayBuffer|Uint8Array>} [options.extraRootCertificates] - Optional extra DER roots.
      * @param {number} [options.timeoutMs] - Abort after this many ms (merged with init.signal if present).
      * @returns {Promise<Response>}
      */
@@ -83,6 +84,7 @@ export class Socks5Client {
         return proxyFetch(input, mergedInit, this._proxyConfig, {
             tlsHostname: options.tlsHostname,
             httpVersion: options.httpVersion,
+            extraRootCertificates: options.extraRootCertificates,
         });
     }
 
@@ -98,6 +100,7 @@ export class Socks5Client {
      * @param {boolean} [options.enableTls=false] - Upgrade tunnel with Rustls WASM TLS.
      * @param {string} [options.tlsHostname] - SNI hostname (defaults to targetHost).
      * @param {string[]} [options.alpnProtocols] - Optional ALPN protocols for TLS negotiation.
+     * @param {Array<ArrayBuffer|Uint8Array>} [options.extraRootCertificates] - Optional extra DER roots.
      * @returns {Promise<{socket: Object, readable: ReadableStream, writable: WritableStream, alpnProtocol?: string|null}>}
      */
     async connect(targetHost, targetPort, options = {}) {
@@ -105,6 +108,7 @@ export class Socks5Client {
             enableTls: options.enableTls || false,
             tlsHostname: options.tlsHostname || targetHost,
             alpnProtocols: options.alpnProtocols,
+            extraRootCertificates: options.extraRootCertificates,
             signal: buildMergedSignal(options.signal, options.timeoutMs),
         });
     }

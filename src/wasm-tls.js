@@ -27,6 +27,7 @@ let wasmInitialized = false;
  * @param {string} tlsHostname - SNI hostname for the TLS handshake.
  * @param {Object} [options] - TLS handshake options.
  * @param {string[]} [options.alpnProtocols] - ALPN protocol list in preference order.
+ * @param {Array<ArrayBuffer|Uint8Array>} [options.extraRootCertificates] - Optional extra DER roots.
  * @param {AbortSignal} [options.signal] - Abort signal for handshake/tunnel teardown.
  * @param {number} [options.maxQueuedAppBytes=4194304] - Max decrypted bytes queued when caller is slow.
  * @returns {Promise<{readable: ReadableStream, writable: WritableStream, alpnProtocol: string|null}>}
@@ -47,12 +48,16 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
         ? options.alpnProtocols.map(p => String(p).trim()).filter(Boolean)
         : [];
     const alpnCsv = alpnProtocols.join(',');
+    const extraRootCertificates = normalizeExtraRootCertificates(options.extraRootCertificates);
 
     if (!tlsHostname || typeof tlsHostname !== 'string' || tlsHostname.length > 253) {
         throw new Error('wasmTls: invalid SNI hostname');
     }
+    if (extraRootCertificates && extraRootCertificates.length > 0 && WasmTlsClient.length < 3) {
+        throw new Error('wasmTls: extraRootCertificates requires a rebuilt rust-tls-wasm/pkg artifact');
+    }
 
-    const client = new WasmTlsClient(tlsHostname, alpnCsv || undefined);
+    const client = new WasmTlsClient(tlsHostname, alpnCsv || undefined, extraRootCertificates);
     const abortError = () => {
         if (signal && signal.reason instanceof Error) return signal.reason;
         if (typeof DOMException === 'function') return new DOMException('Aborted', 'AbortError');
@@ -68,6 +73,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
     let appReadableController = null;
     let queuedAppBytes = 0;
     const appQueue = [];
+    let appDemand = false;
     let demandWaiters = [];
 
     const appReadable = new ReadableStream({
@@ -75,6 +81,7 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
             appReadableController = controller;
         },
         pull() {
+            appDemand = true;
             flushAppQueue();
             wakeDemand();
         },
@@ -148,35 +155,35 @@ export async function wasmTlsHandshake(networkReadable, networkWritable, tlsHost
     function flushAppQueue() {
         while (
             appReadableController &&
+            appDemand &&
             appQueue.length > 0 &&
             appReadableController.desiredSize > 0
         ) {
             const chunk = appQueue.shift();
             queuedAppBytes -= chunk.byteLength;
             appReadableController.enqueue(chunk);
+            appDemand = appReadableController.desiredSize > 0;
         }
     }
 
     function enqueueAppData(appData) {
         if (!appReadableController || closed) return;
-        flushAppQueue();
-        if (appQueue.length === 0 && appReadableController.desiredSize > 0) {
-            appReadableController.enqueue(appData);
-            return;
-        }
         appQueue.push(appData);
         queuedAppBytes += appData.byteLength;
         if (queuedAppBytes > maxQueuedAppBytes) {
-            teardown(new Error(`wasmTls: decrypted data queue exceeded ${maxQueuedAppBytes} bytes`));
+            const err = new Error(`wasmTls: decrypted data queue exceeded ${maxQueuedAppBytes} bytes`);
+            try { appReadableController.error(err); } catch (_) { /* noop */ }
+            teardown(err, { readableError: false });
+            return;
         }
+        flushAppQueue();
     }
 
     async function waitForAppBackpressure() {
         while (
             !closed &&
-            appQueue.length > 0 &&
             appReadableController &&
-            appReadableController.desiredSize <= 0
+            (appQueue.length > 0 || appReadableController.desiredSize <= 0)
         ) {
             await new Promise(resolve => demandWaiters.push(resolve));
         }
@@ -315,4 +322,24 @@ function advanceRustlsNetworkOffset(client, sourceChunk, offset) {
         throw new Error('wasmTls: Rustls consumed 0 bytes from non-empty network data');
     }
     return offset + consumed;
+}
+
+function normalizeExtraRootCertificates(extraRootCertificates) {
+    if (extraRootCertificates == null) return undefined;
+    if (!Array.isArray(extraRootCertificates)) {
+        throw new Error('wasmTls: extraRootCertificates must be an array of ArrayBuffer or Uint8Array');
+    }
+
+    return extraRootCertificates.map((cert, index) => {
+        if (cert instanceof Uint8Array) {
+            return cert;
+        }
+        if (cert instanceof ArrayBuffer) {
+            return new Uint8Array(cert);
+        }
+        if (ArrayBuffer.isView(cert)) {
+            return new Uint8Array(cert.buffer, cert.byteOffset, cert.byteLength);
+        }
+        throw new Error(`wasmTls: extraRootCertificates[${index}] must be ArrayBuffer or Uint8Array`);
+    });
 }

@@ -40,6 +40,7 @@ const MAX_WINDOW_SIZE = 0x7fffffff;            // RFC 9113 §6.9.1: 2^31-1
 const MAX_STREAM_ID = 0x7ffffffe;              // RFC 9113: max client stream ID (odd, < 2^31)
 const MAX_HEADER_LIST_SIZE = 65536;
 const MAX_CONSECUTIVE_EMPTY_CHUNKS = 1024;
+const METHOD_TOKEN_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HEADER_VALUE_RE = /^[\t\x20-\x7E\x80-\xFF]*$/;
 const HTTP2_NOT_NEGOTIATED_ERROR_CODE = 'ERR_SOCKSFLARE_HTTP2_NOT_NEGOTIATED';
@@ -150,11 +151,14 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const targetHost = url.hostname;
     const targetPort = parseInt(url.port, 10) || 443;
     const tlsHostname = options.tlsHostname || targetHost;
+    const method = normalizeRequestMethod(requestInit.method, 'HTTP/2');
+    const bodyMode = await prepareRequestBody(method, requestInit.body, 'HTTP/2');
 
     const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
         enableTls: true,
         tlsHostname,
         alpnProtocols: ['h2', 'http/1.1'],
+        extraRootCertificates: options.extraRootCertificates,
         signal: requestInit.signal,
     });
 
@@ -169,7 +173,7 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const conn = new Http2SingleConnection(tunnel, requestInit.signal);
     try {
         await conn.init();
-        return await conn.fetch(url, requestInit);
+        return await conn.fetch(url, requestInit, { method, bodyMode });
     } catch (err) {
         conn.close(err);
         throw err;
@@ -186,6 +190,7 @@ class Http2SingleConnection {
         this.windowTracker = new WindowTracker();
         this.localInboundMaxFrameSize = DEFAULT_MAX_FRAME_SIZE;
         this.streams = new Map();
+        this.closedTrailersStreams = new Set();
         this.settingsAckPending = false;
         this.closed = false;
         this.abortHandler = signal ? () => this.close(makeAbortError(signal)) : null;
@@ -204,22 +209,16 @@ class Http2SingleConnection {
         this.readLoopPromise = this.readLoop();
     }
 
-    async fetch(url, requestInit) {
+    async fetch(url, requestInit, prepared = null) {
         throwIfAborted(requestInit.signal);
 
-        const method = (requestInit.method || 'GET').toUpperCase();
-        if (!/^[A-Z]+$/.test(method)) {
-            throw new Error(`HTTP/2: invalid method: ${method}`);
-        }
-
+        const method = prepared?.method || normalizeRequestMethod(requestInit.method, 'HTTP/2');
+        const bodyMode = prepared?.bodyMode || await prepareRequestBody(method, requestInit.body, 'HTTP/2');
         const streamId = 1;
         const stream = this.createStreamState(streamId);
         stream.method = method;
         this.streams.set(streamId, stream);
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
-
-        const bodyMode = await normalizeRequestBody(requestInit.body);
-        assertMethodBodyAllowed(method, bodyMode);
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
         const hasBody = bodyMode.kind !== 'none';
 
@@ -260,6 +259,7 @@ class Http2SingleConnection {
             contentLength: null,
             receivedBytes: 0,
             nullBody: false,
+            trailersSeen: false,
             bodyReadable: null,
             bodyWriter: body.writable.getWriter(),
             bodyReader: body.readable.getReader(),
@@ -343,7 +343,14 @@ class Http2SingleConnection {
         }
 
         const stream = this.streams.get(frame.streamId);
-        if (!stream) return;
+        if (!stream) {
+            if (frame.type === FRAME_DATA && this.closedTrailersStreams.has(frame.streamId)) {
+                throw new Error('HTTP/2: DATA after trailers');
+            }
+            if (frame.type === FRAME_DATA) throw new Error('HTTP/2: DATA on unknown stream');
+            if (frame.type === FRAME_HEADERS) throw new Error('HTTP/2: HEADERS on unknown stream');
+            throw new Error('HTTP/2: RST_STREAM on unknown stream');
+        }
 
         if (frame.type === FRAME_RST_STREAM) {
             this.failStream(stream, new Error('HTTP/2: stream reset by peer'));
@@ -370,7 +377,18 @@ class Http2SingleConnection {
                 }
                 stream.headers.resolve({ meta, endStream });
             } else {
+                if (stream.trailersSeen) {
+                    const err = new Error('HTTP/2: duplicate trailing HEADERS');
+                    this.failStream(stream, err);
+                    throw err;
+                }
                 validateResponseHeaders(decoded, true);
+                stream.trailersSeen = true;
+                if (!endStream) {
+                    const err = new Error('HTTP/2: trailing HEADERS must set END_STREAM');
+                    this.failStream(stream, err);
+                    throw err;
+                }
             }
             if (endStream) this.finishStream(stream);
             return;
@@ -378,12 +396,19 @@ class Http2SingleConnection {
         if (!stream.headerSeen) {
             throw new Error('HTTP/2: DATA before response HEADERS');
         }
+        if (stream.trailersSeen) {
+            const err = new Error('HTTP/2: DATA after trailers');
+            this.failStream(stream, err);
+            throw err;
+        }
         const parsed = parseDataPayload(frame.payload, frame.flags);
         if (stream.nullBody) {
             if (parsed.data.byteLength > 0) {
                 this.failStream(stream, new Error('HTTP/2: DATA frame on null-body response'));
                 return;
             }
+            await sendWindowUpdate(this.frameWriter, 0, parsed.flowControlledLength);
+            await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.flowControlledLength);
             if (parsed.endStream) this.finishStream(stream);
             return;
         }
@@ -394,9 +419,9 @@ class Http2SingleConnection {
                 return;
             }
             await stream.bodyWriter.write(parsed.data);
-            await sendWindowUpdate(this.frameWriter, 0, parsed.data.byteLength);
-            await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.data.byteLength);
         }
+        await sendWindowUpdate(this.frameWriter, 0, parsed.flowControlledLength);
+        await sendWindowUpdate(this.frameWriter, frame.streamId, parsed.flowControlledLength);
         if (parsed.endStream) this.finishStream(stream);
     }
 
@@ -486,6 +511,9 @@ class Http2SingleConnection {
             return;
         }
         stream.done = true;
+        if (stream.trailersSeen) {
+            this.closedTrailersStreams.add(stream.streamId);
+        }
         try { stream.bodyWriter.close(); } catch (_) { /* noop */ }
         this.streams.delete(stream.streamId);
         this.windowTracker.streamWindows.delete(stream.streamId);
@@ -495,6 +523,7 @@ class Http2SingleConnection {
     failStream(stream, err) {
         if (stream.done) return;
         stream.done = true;
+        this.closedTrailersStreams.delete(stream.streamId);
         stream.headers.reject(err);
         try { stream.bodyWriter.abort(err); } catch (_) { /* noop */ }
         this.streams.delete(stream.streamId);
@@ -871,16 +900,6 @@ class HpackDecoder {
     }
 }
 
-function getStatusFromDecoded(decoded) {
-    for (const [name, value] of decoded) {
-        if (!name) continue;
-        if (name !== ':status') continue;
-        const code = parseInt(value, 10);
-        if (!Number.isNaN(code)) return code;
-    }
-    return 0;
-}
-
 function isNullBodyResponse(method, status) {
     return method === 'HEAD' || status === 204 || status === 205 || status === 304;
 }
@@ -1001,6 +1020,7 @@ function parseDataPayload(payload, flags) {
     return {
         data: payload.subarray(offset, payload.byteLength - padLength),
         endStream: (flags & FLAG_END_STREAM) === FLAG_END_STREAM,
+        flowControlledLength: payload.byteLength,
     };
 }
 
@@ -1042,10 +1062,27 @@ async function normalizeRequestBody(body) {
     throw new Error(`Unsupported request body type: ${Object.prototype.toString.call(body)}`);
 }
 
-function assertMethodBodyAllowed(method, bodyMode) {
+function assertMethodBodyAllowed(method, bodyMode, protocol = 'HTTP/2') {
     if ((method === 'GET' || method === 'HEAD') && bodyMode.kind !== 'none') {
-        throw new Error(`HTTP/2: ${method} requests cannot have a body`);
+        throw new Error(`${protocol}: ${method} requests cannot have a body`);
     }
+}
+
+function normalizeRequestMethod(method, protocol) {
+    const normalized = String(method || 'GET').toUpperCase();
+    if (!METHOD_TOKEN_RE.test(normalized)) {
+        throw new Error(`${protocol}: invalid method: ${normalized}`);
+    }
+    return normalized;
+}
+
+async function prepareRequestBody(method, body, protocol) {
+    if ((method === 'GET' || method === 'HEAD') && body != null) {
+        throw new Error(`${protocol}: ${method} requests cannot have a body`);
+    }
+    const bodyMode = await normalizeRequestBody(body);
+    assertMethodBodyAllowed(method, bodyMode, protocol);
+    return bodyMode;
 }
 
 function buildRequestHeaders(url, requestInit, method, bodyMode) {
