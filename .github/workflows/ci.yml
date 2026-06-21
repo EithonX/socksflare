@@ -38,5 +38,8 @@ jobs:
       - name: Run full test suite
         run: npm test
 
+      - name: Run package smoke test
+        run: npm run test:package
+
       - name: Dry-run package
         run: npm run pack:dry

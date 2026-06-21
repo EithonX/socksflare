@@ -12,9 +12,12 @@ Failing to do so may allow users to reach arbitrary internal or external hosts t
 
 ## Reporting Vulnerabilities
 
-If you discover a security vulnerability, please:
+If you discover a security vulnerability, please open a GitHub issue in the [socksflare repository](https://github.com/EithonX/socksflare/issues).
 
-1. **Open a GitHub issue** in the [socksflare repository](https://github.com/EithonX/socksflare/issues), or  
-2. **Contact the maintainer** directly through the GitHub repository.
+If the issue includes sensitive exploit details, keep the public issue brief and mention that you can provide reproduction details privately if needed.
 
-Please include a clear description of the issue and steps to reproduce it.
+Please include:
+- what component is affected
+- what behavior you expected
+- what happened instead
+- minimal reproduction steps when safe to share

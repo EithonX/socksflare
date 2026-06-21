@@ -52,12 +52,14 @@ npm run check
 npm test
 npm run test:unit
 npm run test:integration
+npm run test:package
 npm run pack:dry
+npm run release:check
 ```
 
 Integration tests use local mock HTTP and SOCKS5 servers only. No external network, Cloudflare credentials, or third-party SOCKS proxy required.
 
-Local TLS and HTTP/2 integration coverage now runs against local HTTPS and `h2` origins over the SOCKS tunnel. In this repository snapshot, that harness uses a Node TLS shim for the test-only handshake path because the Rust/WASM rebuild toolchain is not available in the checked-in environment; the public Rustls-facing API and queue/backpressure logic remain covered by unit tests.
+Local TLS and HTTP/2 integration coverage runs against local HTTPS and `h2` origins over the SOCKS tunnel. The integration harness uses a Node TLS shim for the test-only handshake path; Rustls WASM bindings and backpressure behavior are covered by unit and release checks.
 
 ## Required: `wrangler.toml` Setup
 
@@ -132,13 +134,13 @@ const response = await proxy.fetch('https://example.com', {
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
 | `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 then fall back only if ALPN does not negotiate `h2`, or require HTTP/2 |
 | `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()` when available, with fallback timer wiring otherwise) |
-| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | Advanced/testing-only extra DER root certificates for local TLS or private PKI (requires a regenerated `rust-tls-wasm/pkg/` artifact) |
+| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | Advanced/testing-only extra DER root certificates for local TLS or private PKI |
 
 `tlsHostname` is advanced-only. Overriding it can intentionally create an SNI/Host mismatch, which some targets reject and some security tools flag.
 
 **Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet. `GET` and `HEAD` request bodies are rejected.
 
-**HTTP/2:** experimental single-stream implementation. Keep `httpVersion: '1.1'` for release-critical traffic until local SOCKS5/TLS/H2 integration tests pass.
+**HTTP/2:** experimental single-stream implementation. Use `httpVersion: '1.1'` for release-critical traffic unless you have tested your target with the H2 path.
 
 ### `client.connect(targetHost, targetPort, options?)`
 
@@ -165,7 +167,7 @@ await writer.write(new TextEncoder().encode('EHLO example.com\r\n'));
 | `options.alpnProtocols` | `string[]` | — | Optional ALPN protocols (for example `['h2', 'http/1.1']`) |
 | `options.signal` | `AbortSignal` | — | Abort signal for connection / handshake teardown |
 | `options.timeoutMs` | `number` | — | Abort after this many milliseconds |
-| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | — | Advanced/testing-only extra DER root certificates for local TLS or private PKI (requires a regenerated `rust-tls-wasm/pkg/` artifact) |
+| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | — | Advanced/testing-only extra DER root certificates for local TLS or private PKI |
 
 ### Low-level Exports
 
@@ -241,7 +243,7 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
-- **HTTP/2:** Experimental and single-stream. Local SOCKS + TLS + ALPN integration tests now exercise the H2 path, but the committed test harness still uses a Node TLS shim rather than a rebuilt Rustls WASM artifact.
+- **HTTP/2:** Experimental and single-stream. Local SOCKS + TLS + ALPN integration tests exercise the H2 JavaScript path through a Node TLS shim; Rustls WASM API compatibility is guarded separately.
 - **FormData:** Request bodies using `FormData` are rejected for now.
 - **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
 
