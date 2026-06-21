@@ -57,6 +57,8 @@ npm run pack:dry
 
 Integration tests use local mock HTTP and SOCKS5 servers only. No external network, Cloudflare credentials, or third-party SOCKS proxy required.
 
+Local TLS and HTTP/2 integration coverage now runs against local HTTPS and `h2` origins over the SOCKS tunnel. In this repository snapshot, that harness uses a Node TLS shim for the test-only handshake path because the Rust/WASM rebuild toolchain is not available in the checked-in environment; the public Rustls-facing API and queue/backpressure logic remain covered by unit tests.
+
 ## Required: `wrangler.toml` Setup
 
 Any Worker using this library **must** include the following rule in their `wrangler.toml` so the WASM binary is bundled correctly:
@@ -130,6 +132,9 @@ const response = await proxy.fetch('https://example.com', {
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
 | `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 then fall back only if ALPN does not negotiate `h2`, or require HTTP/2 |
 | `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()` when available, with fallback timer wiring otherwise) |
+| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | Advanced/testing-only extra DER root certificates for local TLS or private PKI (requires a regenerated `rust-tls-wasm/pkg/` artifact) |
+
+`tlsHostname` is advanced-only. Overriding it can intentionally create an SNI/Host mismatch, which some targets reject and some security tools flag.
 
 **Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet. `GET` and `HEAD` request bodies are rejected.
 
@@ -138,6 +143,9 @@ const response = await proxy.fetch('https://example.com', {
 ### `client.connect(targetHost, targetPort, options?)`
 
 Low-level raw tunnel for non-HTTP protocols (SMTP, custom protocols, etc.).
+
+> [!CAUTION]
+> SOCKS5 username/password authentication is sent in plaintext to the SOCKS proxy (per RFC 1929). Use only with a trusted, local, or otherwise protected proxy hop.
 
 ```javascript
 const { readable, writable } = await proxy.connect('smtp.example.com', 465, {
@@ -155,6 +163,9 @@ await writer.write(new TextEncoder().encode('EHLO example.com\r\n'));
 | `options.enableTls` | `boolean` | `false` | Upgrade tunnel with TLS via Rustls WASM |
 | `options.tlsHostname` | `string` | `targetHost` | SNI hostname |
 | `options.alpnProtocols` | `string[]` | — | Optional ALPN protocols (for example `['h2', 'http/1.1']`) |
+| `options.signal` | `AbortSignal` | — | Abort signal for connection / handshake teardown |
+| `options.timeoutMs` | `number` | — | Abort after this many milliseconds |
+| `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | — | Advanced/testing-only extra DER root certificates for local TLS or private PKI (requires a regenerated `rust-tls-wasm/pkg/` artifact) |
 
 ### Low-level Exports
 
@@ -181,6 +192,18 @@ wasm-pack build --target web
 # $env:CC_wasm32_unknown_unknown = $env:CC
 # wasm-pack build --target web
 ```
+
+### Building WASM without installing Rust locally
+
+If you do not want to install Rust/wasm-pack locally, run the manual GitHub Actions workflow:
+
+1. Go to GitHub → Actions → Build WASM pkg.
+2. Click “Run workflow”.
+3. Wait for it to finish.
+4. Download the `rust-tls-wasm-pkg` artifact.
+5. Replace the local `rust-tls-wasm/pkg/` directory with the artifact contents.
+6. Run `npm run release:check`.
+7. Commit the regenerated `rust-tls-wasm/pkg/` files manually.
 
 ## Project Structure
 
@@ -218,7 +241,7 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
-- **HTTP/2:** Experimental and single-stream. It has protocol hardening, but should not be treated as release-grade until integration tests cover flow control, aborts, malformed frames, and body cancellation.
+- **HTTP/2:** Experimental and single-stream. Local SOCKS + TLS + ALPN integration tests now exercise the H2 path, but the committed test harness still uses a Node TLS shim rather than a rebuilt Rustls WASM artifact.
 - **FormData:** Request bodies using `FormData` are rejected for now.
 - **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
 

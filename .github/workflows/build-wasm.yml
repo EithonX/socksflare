@@ -1,0 +1,71 @@
+name: Build WASM pkg
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - rust-tls-wasm/**
+      - .github/workflows/build-wasm.yml
+      - scripts/check-wasm-api.mjs
+      - package.json
+      - package-lock.json
+  pull_request:
+    paths:
+      - rust-tls-wasm/**
+      - .github/workflows/build-wasm.yml
+      - scripts/check-wasm-api.mjs
+      - package.json
+      - package-lock.json
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and validate WASM pkg
+        run: npm run build:wasm
+
+      - name: Check WASM API
+        run: npm run check:wasm-api
+
+      - name: Check syntax
+        run: npm run check
+
+      - name: Run unit tests
+        run: npm run test:unit
+
+      - name: Run integration tests
+        run: npm run test:integration
+
+      - name: Run full test suite
+        run: npm test
+
+      - name: Dry-run package
+        run: npm run pack:dry
+
+      - name: Upload regenerated pkg
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-tls-wasm-pkg
+          path: rust-tls-wasm/pkg/**
