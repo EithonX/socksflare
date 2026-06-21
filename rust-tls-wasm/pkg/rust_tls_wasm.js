@@ -59,15 +59,16 @@ export class WasmTlsClient {
     /**
      * @param {string} hostname
      * @param {string | null} [alpn_csv]
+     * @param {Array<any> | null} [extra_roots]
      */
-    constructor(hostname, alpn_csv) {
+    constructor(hostname, alpn_csv, extra_roots) {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
             const ptr0 = passStringToWasm0(hostname, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
             const len0 = WASM_VECTOR_LEN;
             var ptr1 = isLikeNone(alpn_csv) ? 0 : passStringToWasm0(alpn_csv, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
             var len1 = WASM_VECTOR_LEN;
-            wasm.wasmtlsclient_new(retptr, ptr0, len0, ptr1, len1);
+            wasm.wasmtlsclient_new(retptr, ptr0, len0, ptr1, len1, isLikeNone(extra_roots) ? 0 : addHeapObject(extra_roots));
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -193,6 +194,24 @@ function __wbg_get_imports() {
         __wbg_getRandomValues_c44a50d8cfdaebeb: function() { return handleError(function (arg0, arg1) {
             getObject(arg0).getRandomValues(getObject(arg1));
         }, arguments); },
+        __wbg_get_unchecked_329cfe50afab7352: function(arg0, arg1) {
+            const ret = getObject(arg0)[arg1 >>> 0];
+            return addHeapObject(ret);
+        },
+        __wbg_instanceof_Uint8Array_740438561a5b956d: function(arg0) {
+            let result;
+            try {
+                result = getObject(arg0) instanceof Uint8Array;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_length_b3416cf66a5452c8: function(arg0) {
+            const ret = getObject(arg0).length;
+            return ret;
+        },
         __wbg_length_ea16607d7b61445b: function(arg0) {
             const ret = getObject(arg0).length;
             return ret;

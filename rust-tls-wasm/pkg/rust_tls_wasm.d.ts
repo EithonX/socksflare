@@ -10,7 +10,7 @@ export class WasmTlsClient {
     extract_network_data(): Uint8Array;
     is_handshaking(): boolean;
     negotiatedAlpn(): string | undefined;
-    constructor(hostname: string, alpn_csv?: string | null);
+    constructor(hostname: string, alpn_csv?: string | null, extra_roots?: Array<any> | null);
     /**
      * Feeds raw TCP bytes from the SOCKS5 proxy into the Rustls state machine.
      * Returns the number of bytes consumed.
@@ -36,7 +36,7 @@ export interface InitOutput {
     readonly wasmtlsclient_extract_network_data: (a: number, b: number) => void;
     readonly wasmtlsclient_is_handshaking: (a: number) => number;
     readonly wasmtlsclient_negotiatedAlpn: (a: number, b: number) => void;
-    readonly wasmtlsclient_new: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly wasmtlsclient_new: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly wasmtlsclient_provide_network_data: (a: number, b: number, c: number, d: number) => void;
     readonly wasmtlsclient_read_app_data: (a: number, b: number) => void;
     readonly wasmtlsclient_wants_read: (a: number) => number;
