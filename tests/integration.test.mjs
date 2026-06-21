@@ -795,6 +795,38 @@ async function readAllBytes(readable) {
   return out;
 }
 
+async function readTextUntil(readable, needle, maxBytes = 65536) {
+  const reader = readable.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let total = 0;
+
+  try {
+    while (!text.includes(needle)) {
+      const { done, value } = await withTimeout(reader.read());
+      if (done) break;
+
+      total += value.byteLength;
+      if (total > maxBytes) {
+        throw new Error(`Response exceeded ${maxBytes} bytes before finding ${needle}`);
+      }
+
+      text += decoder.decode(value, { stream: true });
+    }
+
+    text += decoder.decode();
+
+    if (!text.includes(needle)) {
+      throw new Error(`Response ended before finding ${needle}. Response so far:\n${text}`);
+    }
+
+    return text;
+  } finally {
+    try { await reader.cancel(); } catch (_) { /* Windows may report socket reset during teardown */ }
+    try { reader.releaseLock(); } catch (_) { /* noop */ }
+  }
+}
+
 test('proxyFetch fetches local HTTP/1.1 origin through SOCKS5 domain tunnel', async (t) => {
   const harness = await createHarness();
   t.after(() => harness.close());
@@ -945,14 +977,18 @@ test('socks5Connect TLS tunnel reaches local HTTPS origin with extra roots', asy
   );
 
   const writer = tunnel.writable.getWriter();
-  await writer.write(new TextEncoder().encode(
-    `GET /hello HTTP/1.1\r\nHost: localhost:${harness.httpsOrigin.port}\r\nConnection: close\r\n\r\n`,
-  ));
-  writer.releaseLock();
+  try {
+    await writer.write(new TextEncoder().encode(
+      `GET /hello HTTP/1.1\r\nHost: localhost:${harness.httpsOrigin.port}\r\nConnection: close\r\n\r\n`,
+    ));
+  } finally {
+    writer.releaseLock();
+  }
 
-  const response = new TextDecoder().decode(await readAllBytes(tunnel.readable));
+  const response = await readTextUntil(tunnel.readable, 'hello via local-https!');
   assert.match(response, /^HTTP\/1\.1 200 OK/m);
   assert.match(response, /hello via local-https!/);
+  try { await tunnel.socket.close(); } catch (_) { /* noop */ }
 });
 
 test('proxyFetch HTTPS HTTP/1.1 works against local TLS origin', async (t) => {
