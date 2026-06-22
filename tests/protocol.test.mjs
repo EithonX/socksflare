@@ -42,6 +42,8 @@ const h2 = loadSource('proxy-fetch-http2.js', [
   'FRAME_RST_STREAM',
   'FRAME_SETTINGS',
   'FRAME_GOAWAY',
+  'FRAME_PING',
+  'FRAME_CONTINUATION',
   'FRAME_PRIORITY',
   'FRAME_WINDOW_UPDATE',
   'FLAG_END_HEADERS',
@@ -809,6 +811,39 @@ test('HTTP/2 body cancellation sends RST_STREAM and closes', async () => {
   assert.equal(writes.some(frame => frame[3] === h2.FRAME_RST_STREAM), true);
 });
 
+test('HTTP/2 GOAWAY before response rejects pending request with clear error', async () => {
+  const { conn } = h2Conn();
+  conn.frameReader.readFrame = async () => ({
+    type: h2.FRAME_GOAWAY,
+    flags: 0,
+    streamId: 0,
+    payload: Uint8Array.of(0, 0, 0, 1, 0, 0, 0, 2),
+  });
+
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+  const loopPromise = conn.readLoop();
+
+  await assert.rejects(withTimeout(fetchPromise), /HTTP\/2: peer sent GOAWAY \(2\)/);
+  await withTimeout(loopPromise);
+});
+
+test('HTTP/2 RST_STREAM before response rejects pending request', async () => {
+  const { conn } = h2Conn();
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_RST_STREAM,
+    flags: 0,
+    streamId: 1,
+    payload: u32(0),
+  });
+
+  await assert.rejects(withTimeout(fetchPromise), /stream reset by peer/);
+});
+
 test('HTTP/2 malformed control frames reject', async () => {
   const { conn } = h2Conn();
 
@@ -832,6 +867,23 @@ test('HTTP/2 malformed control frames reject', async () => {
     () => conn.handleWindowUpdate({ streamId: 0, payload: u32(0) }),
     /WINDOW_UPDATE increment of 0/,
   );
+});
+
+test('HTTP/2 PING without ACK gets ACKed', async () => {
+  const { conn, writes } = h2Conn();
+  const payload = Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8);
+
+  await conn.handleControlFrame({
+    type: h2.FRAME_PING,
+    flags: 0,
+    streamId: 0,
+    payload,
+  });
+
+  const pingAck = writes.find(frame => frame[3] === h2.FRAME_PING);
+  assert.ok(pingAck);
+  assert.equal(pingAck[4], h2.FLAG_ACK);
+  assert.deepEqual(Array.from(pingAck.subarray(9)), Array.from(payload));
 });
 
 test('HTTP/2 WINDOW_UPDATE after stream closed is ignored', () => {
@@ -997,6 +1049,72 @@ test('HTTP/2 null-body response that sends non-empty DATA rejects', async () => 
   await assert.rejects(withTimeout(readPromise), /DATA frame on null-body response/);
 });
 
+test('HTTP/2 HEAD response returns null body and rejects unexpected body data', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  stream.method = 'HEAD';
+  conn.streams.set(1, stream);
+  conn.windowTracker.streamWindows.set(1, 65535);
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200'], ['content-length', '5']]),
+  });
+
+  const { meta, endStream } = await stream.headers.promise;
+  assert.equal(meta.status, 200);
+  assert.equal(endStream, false);
+  assert.equal(stream.nullBody, true);
+
+  const readPromise = stream.bodyReadable.getReader().read();
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: 0,
+    streamId: 1,
+    payload: bytes('hello'),
+  });
+
+  await assert.rejects(withTimeout(readPromise), /DATA frame on null-body response/);
+});
+
+test('HTTP/2 DATA before response HEADERS rejects', async () => {
+  const { conn } = h2Conn();
+  const stream = conn.createStreamState(1);
+  conn.streams.set(1, stream);
+
+  await assert.rejects(
+    conn.handleFrame({
+      type: h2.FRAME_DATA,
+      flags: 0,
+      streamId: 1,
+      payload: bytes('x'),
+    }),
+    /DATA before response HEADERS/,
+  );
+});
+
+test('HTTP/2 invalid continuation sequence rejects interleaved non-CONTINUATION frame', async () => {
+  const { conn } = h2Conn();
+  conn.frameReader.readFrame = async () => ({
+    type: h2.FRAME_DATA,
+    flags: 0,
+    streamId: 1,
+    payload: bytes('x'),
+  });
+
+  await assert.rejects(
+    conn.readHeaderBlock({
+      type: h2.FRAME_HEADERS,
+      flags: 0,
+      streamId: 1,
+      payload: h2HeaderBlock([[':status', '200']]),
+    }),
+    /invalid continuation sequence/,
+  );
+});
+
 test('HTTP/2 body exceeds Content-Length closes socket', async () => {
   const { conn, socket } = h2Conn();
   const stream = conn.createStreamState(1);
@@ -1035,6 +1153,56 @@ test('HTTP/2 RST_STREAM closes socket', async () => {
 
   await assert.rejects(withTimeout(readPromise), /stream reset by peer/);
   assert.equal(socket.closed, true);
+});
+
+test('HTTP/2 informational 103 followed by final 200 response succeeds', async () => {
+  const { conn } = h2Conn();
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '103'], ['link', '</style.css>; rel=preload; as=style']]),
+  });
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200'], ['content-length', '2']]),
+  });
+
+  const res = await withTimeout(fetchPromise);
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: bytes('ok'),
+  });
+
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), 'ok');
+});
+
+test('HTTP/2 101 Switching Protocols rejects request', async () => {
+  const { conn } = h2Conn();
+  const fetchPromise = conn.fetch(new URL('https://example.com/'), { method: 'GET' });
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '101']]),
+  });
+
+  await assert.rejects(withTimeout(fetchPromise), /101 Switching Protocols is not supported/);
 });
 
 test('HTTP/2 truncated body through finishStream closes socket', async () => {

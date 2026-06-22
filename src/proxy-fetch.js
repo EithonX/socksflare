@@ -1,7 +1,7 @@
 /**
  * Fetch over a SOCKS5 tunnel for Cloudflare Workers.
  *
- * Default path is HTTP/1.1, with optional experimental HTTP/2 dispatch.
+ * Default path is HTTP/1.1, with optional per-request HTTP/2 dispatch.
  *
  * Handles:
  * - Content-Length based responses (exact byte read, no TCP-close wait)

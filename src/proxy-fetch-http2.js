@@ -1,7 +1,8 @@
 /**
  * HTTP/2 fetch over SOCKS5 + Rustls WASM TLS.
  *
- * Experimental single-stream HTTP/2 with RFC 9113 compliance hardening.
+ * Per-request HTTP/2 transport. One HTTP/2 stream is used per SOCKS5/TLS
+ * tunnel; connection pooling and multiplexing are intentionally out of scope.
  *
  * @module proxy-fetch-http2
  * @license GPL-3.0-or-later

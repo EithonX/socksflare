@@ -1029,6 +1029,33 @@ test('proxyFetch HTTPS HTTP/2 works against local H2 TLS origin', async (t) => {
   assert.equal(await res.text(), 'hello via local-h2!');
 });
 
+test('proxyFetch HTTPS HTTP/2 POST echoes byte body through local H2 TLS origin', async (t) => {
+  const harness = await createTlsHarness();
+  t.after(() => harness.close());
+
+  const body = Uint8Array.from([0, 1, 2, 200, 201, 202, 255]);
+  const res = await proxyFetch(
+    harness.http2Origin.url('/echo'),
+    {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+      },
+      body,
+    },
+    harness.proxyConfig,
+    {
+      httpVersion: '2',
+      extraRootCertificates: harness.extraRootCertificates,
+    },
+  );
+
+  const echoed = new Uint8Array(await res.arrayBuffer());
+  assert.equal(res.status, 201);
+  assert.equal(res.headers.get('x-origin'), 'local-h2');
+  assert.deepEqual(echoed, body);
+});
+
 test('proxyFetch HTTPS auto negotiates HTTP/2 when ALPN offers h2', async (t) => {
   const harness = await createTlsHarness();
   t.after(() => harness.close());

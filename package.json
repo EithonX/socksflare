@@ -7,6 +7,7 @@
   "types": "./index.d.ts",
   "scripts": {
     "check": "node scripts/check-syntax.mjs",
+    "check:worker-safe": "node scripts/check-worker-safe.mjs",
     "build:wasm": "cd rust-tls-wasm && wasm-pack build --target web",
     "check:wasm-api": "node scripts/check-wasm-api.mjs",
     "test": "node --test tests/protocol.test.mjs tests/integration.test.mjs tests/types-smoke.test.mjs",
@@ -14,8 +15,8 @@
     "test:integration": "node --test tests/integration.test.mjs",
     "test:package": "node --test tests/package-smoke.test.mjs",
     "pack:dry": "npm pack --dry-run",
-    "release:check": "npm run check && npm run check:wasm-api && npm run test:unit && npm run test:integration && npm test && npm run test:package && npm run pack:dry",
-    "prepublishOnly": "npm run check && npm run check:wasm-api && npm test && npm run test:package && npm run pack:dry"
+    "release:check": "npm run check && npm run check:worker-safe && npm run check:wasm-api && npm run test:unit && npm run test:integration && npm test && npm run test:package && npm run pack:dry",
+    "prepublishOnly": "npm run check && npm run check:worker-safe && npm run check:wasm-api && npm test && npm run test:package && npm run pack:dry"
   },
   "exports": {
     ".": {

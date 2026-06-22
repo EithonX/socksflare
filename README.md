@@ -140,7 +140,7 @@ const response = await proxy.fetch('https://example.com', {
 
 **Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet. `GET` and `HEAD` request bodies are rejected.
 
-**HTTP/2:** experimental single-stream implementation. Use `httpVersion: '1.1'` for release-critical traffic unless you have tested your target with the H2 path.
+**HTTP/2:** per-request HTTP/2 implementation. Each `proxy.fetch()` opens a fresh SOCKS5/TLS tunnel, so one HTTP/2 request stream is used per connection by design. Socksflare does not currently pool or multiplex multiple fetches over one shared HTTP/2 connection. For maximum compatibility, `httpVersion: '1.1'` remains safest; `httpVersion: 'auto'` or `'2'` can use H2 when your target supports it.
 
 ### `client.connect(targetHost, targetPort, options?)`
 
@@ -213,18 +213,22 @@ If you do not want to install Rust/wasm-pack locally, run the manual GitHub Acti
 socksflare/
 ├── .github/
 │   └── workflows/
+        ├── build-wasm.yml
 │       └── ci.yml
 ├── scripts/
-│   └── check-syntax.mjs
+│   ├── check-syntax.mjs
+│   ├── check-worker-safe.mjs
+│   └── check-wasm-api.mjs
 ├── src/
 │   ├── index.js             ← Main export: Socks5Client class
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
 │   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
-│   ├── proxy-fetch-http2.js ← Experimental single-stream HTTP/2 path
+│   ├── proxy-fetch-http2.js ← Per-request HTTP/2 path
 │   └── wasm-tls.js          ← JS bridge to Rustls WASM
 ├── tests/
 │   ├── protocol.test.mjs    ← Protocol/unit coverage
 │   ├── integration.test.mjs ← Local SOCKS5 + HTTP integration harness
+│   ├── package-smoke.test.mjs ← Publish/package smoke coverage
 │   └── types-smoke.test.mjs ← Package metadata smoke coverage
 ├── rust-tls-wasm/
 │   ├── src/lib.rs           ← Rustls WasmTlsClient
@@ -243,7 +247,7 @@ socksflare/
 
 - **TLS Fingerprint (JA3/JA4):** Rustls produces a different TLS ClientHello than Chrome/Firefox. Sites with aggressive bot detection may flag this. This is inherent to using a non-browser TLS stack.
 - **Accept-Encoding:** Requests are sent with `Accept-Encoding: identity` to avoid decompression issues inside Workers. This is slightly unusual but not flagged by any known WAF.
-- **HTTP/2:** Experimental and single-stream. Local SOCKS + TLS + ALPN integration tests exercise the H2 JavaScript path through a Node TLS shim; Rustls WASM API compatibility is guarded separately.
+- **HTTP/2:** Supported as per-request transport. Each `proxy.fetch()` opens its own SOCKS5/TLS tunnel and uses one HTTP/2 stream on that connection. Socksflare does not currently pool or multiplex multiple fetches over a shared H2 connection. For maximum compatibility, `httpVersion: '1.1'` remains default. `httpVersion: 'auto'` tries H2 and falls back to HTTP/1.1 only when ALPN does not negotiate `h2`.
 - **FormData:** Request bodies using `FormData` are rejected for now.
 - **HTTP/3 Not Implemented:** HTTP/3 (QUIC/UDP) is not implemented in this library as Cloudflare Workers limit arbitrary outboard UDP.
 
