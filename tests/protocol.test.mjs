@@ -570,6 +570,86 @@ test('SOCKS5 rejects unsupported selected auth method 0x01', async () => {
   }
 });
 
+test('SOCKS5 with credentials offers only username/password auth', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0xff),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect(
+        { hostname: 'proxy.test', port: 1080, username: 'user', password: 'pass' },
+        'example.com',
+        80,
+      ),
+      /no acceptable auth method/,
+    );
+    assert.deepEqual(Array.from(mock.writes[0]), [0x05, 0x01, 0x02]);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 with credentials rejects server-selected no-auth downgrade', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x00),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect(
+        { hostname: 'proxy.test', port: 1080, username: 'user', password: 'pass' },
+        'example.com',
+        80,
+      ),
+      /auth downgrade refused|selected no-auth/,
+    );
+    assert.deepEqual(Array.from(mock.writes[0]), [0x05, 0x01, 0x02]);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 without credentials offers only no-auth method', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0xff),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80),
+      /no acceptable auth method/,
+    );
+    assert.deepEqual(Array.from(mock.writes[0]), [0x05, 0x01, 0x00]);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
 test('SOCKS5 rejects unsupported selected auth method 0x7f', async () => {
   const prevConnect = globalThis.connect;
   const prevTls = globalThis.wasmTlsHandshake;
@@ -591,6 +671,82 @@ test('SOCKS5 rejects unsupported selected auth method 0x7f', async () => {
     globalThis.connect = prevConnect;
     globalThis.wasmTlsHandshake = prevTls;
   }
+});
+
+test('SOCKS5 server requiring auth succeeds when credentials are provided', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x02),
+    Uint8Array.of(0x01, 0x00),
+    Uint8Array.of(0x05, 0x00, 0x00, 0x01),
+    Uint8Array.of(127, 0, 0, 1, 0x1f, 0x90),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    const tunnel = await socksApi.socks5Connect(
+      { hostname: 'proxy.test', port: 1080, username: 'user', password: 'pass' },
+      'example.com',
+      80,
+    );
+    assert.equal(tunnel.socket, mock.socket);
+    assert.deepEqual(Array.from(mock.writes[0]), [0x05, 0x01, 0x02]);
+    assert.deepEqual(Array.from(mock.writes[1]), [
+      0x01, 0x04, 0x75, 0x73, 0x65, 0x72, 0x04, 0x70, 0x61, 0x73, 0x73,
+    ]);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 server requiring auth fails when credentials are missing', async () => {
+  const prevConnect = globalThis.connect;
+  const prevTls = globalThis.wasmTlsHandshake;
+  const mock = createMockSocksSocket([
+    Uint8Array.of(0x05, 0x02),
+  ]);
+
+  globalThis.connect = () => mock.socket;
+  globalThis.wasmTlsHandshake = async () => {
+    throw new Error('unexpected TLS handshake');
+  };
+
+  try {
+    await assert.rejects(
+      socksApi.socks5Connect({ hostname: 'proxy.test', port: 1080 }, 'example.com', 80),
+      /server requires auth but no credentials provided|unsupported auth method selected: 0x02/,
+    );
+    assert.deepEqual(Array.from(mock.writes[0]), [0x05, 0x01, 0x00]);
+  } finally {
+    globalThis.connect = prevConnect;
+    globalThis.wasmTlsHandshake = prevTls;
+  }
+});
+
+test('SOCKS5 rejects empty username or password values', async () => {
+  await assert.rejects(
+    socksApi.socks5Connect(
+      { hostname: 'proxy.test', port: 1080, username: '', password: 'pass' },
+      'example.com',
+      80,
+    ),
+    /username must not be empty/,
+  );
+
+  await assert.rejects(
+    socksApi.socks5Connect(
+      { hostname: 'proxy.test', port: 1080, username: 'user', password: '' },
+      'example.com',
+      80,
+    ),
+    /password must not be empty/,
+  );
 });
 
 test('SOCKS5 rejects bad username/password auth response version', async () => {

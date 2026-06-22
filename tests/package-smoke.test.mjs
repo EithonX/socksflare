@@ -35,6 +35,7 @@ const REQUIRED = [
   'rust-tls-wasm/pkg/rust_tls_wasm_bg.wasm',
   'README.md',
   'LICENSE',
+  'SECURITY.md',
   'example/worker.js',
 ];
 

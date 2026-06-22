@@ -256,6 +256,12 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
   if ((username === undefined) !== (password === undefined)) {
     throw new Error('SOCKS5: username and password must be provided together');
   }
+  if (username !== undefined && String(username).length === 0) {
+    throw new Error('SOCKS5: username must not be empty');
+  }
+  if (password !== undefined && String(password).length === 0) {
+    throw new Error('SOCKS5: password must not be empty');
+  }
 
   const useAuth = username !== undefined && password !== undefined;
   const enableTls = options.enableTls || false;
@@ -296,7 +302,7 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
 
     // ── Method Negotiation ──
     const methodReq = useAuth
-      ? new Uint8Array([SOCKS_VERSION, 2, AUTH_NONE, AUTH_USERPASS])
+      ? new Uint8Array([SOCKS_VERSION, 1, AUTH_USERPASS])
       : new Uint8Array([SOCKS_VERSION, 1, AUTH_NONE]);
     await writer.write(methodReq);
     throwIfAborted(signal);
@@ -312,12 +318,15 @@ export async function socks5Connect(proxyConfig, targetHost, targetPort, options
     if (methodResp[1] !== AUTH_NONE && methodResp[1] !== AUTH_USERPASS) {
       throw new Error(`SOCKS5: unsupported auth method selected: 0x${methodResp[1].toString(16).padStart(2, '0')}`);
     }
+    if (useAuth && methodResp[1] !== AUTH_USERPASS) {
+      throw new Error('SOCKS5: auth downgrade refused: server selected no-auth even though credentials were configured');
+    }
+    if (!useAuth && methodResp[1] === AUTH_USERPASS) {
+      throw new Error('SOCKS5: server requires auth but no credentials provided');
+    }
 
     // ── Username/Password Authentication ──
     if (methodResp[1] === AUTH_USERPASS) {
-      if (!username || !password) {
-        throw new Error('SOCKS5: server requires auth but no credentials provided');
-      }
       const encoder = new TextEncoder();
       const userBytes = encoder.encode(username);
       const passBytes = encoder.encode(password);

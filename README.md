@@ -93,13 +93,37 @@ export default {
     const raw = new URL(request.url).searchParams.get('url');
     if (!raw) return new Response('Missing ?url=', { status: 400 });
 
-    const target = new URL(raw);
+    let target;
+    try {
+      target = new URL(raw);
+    } catch {
+      return new Response('Invalid URL', { status: 400 });
+    }
+
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+      return new Response('Only http:// and https:// URLs are allowed', { status: 400 });
+    }
+
+    if (target.username || target.password) {
+      return new Response('Target URL must not include credentials', { status: 400 });
+    }
+
     if (!ALLOWED_HOSTS.has(target.hostname)) {
       return new Response('Hostname not allowed', { status: 403 });
     }
 
+    const headers = new Headers();
+    for (const name of ['accept', 'accept-language', 'content-type', 'user-agent']) {
+      const value = request.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+
     // Fetch-like helper — routes through SOCKS5 + Rustls WASM TLS
-    return proxy.fetch(target, {}, { timeoutMs: 15000 });
+    return proxy.fetch(target, {
+      method: request.method,
+      headers,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
+    }, { timeoutMs: 15000 });
   },
 };
 ```
@@ -213,7 +237,7 @@ If you do not want to install Rust/wasm-pack locally, run the manual GitHub Acti
 socksflare/
 ├── .github/
 │   └── workflows/
-        ├── build-wasm.yml
+│       ├── build-wasm.yml
 │       └── ci.yml
 ├── scripts/
 │   ├── check-syntax.mjs
@@ -240,6 +264,7 @@ socksflare/
 ├── index.d.ts
 ├── package.json
 ├── LICENSE                  ← GPL-3.0-or-later
+├── SECURITY.md
 └── README.md
 ```
 

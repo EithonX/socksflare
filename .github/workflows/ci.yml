@@ -29,6 +29,12 @@ jobs:
       - name: Check syntax
         run: npm run check
 
+      - name: Check worker-safe imports
+        run: npm run check:worker-safe
+
+      - name: Check WASM API surface
+        run: npm run check:wasm-api
+
       - name: Run unit tests
         run: npm run test:unit
 

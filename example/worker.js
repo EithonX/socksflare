@@ -42,17 +42,28 @@ export default {
             return new Response('Invalid URL', { status: 400 });
         }
 
+        if (target.protocol !== 'http:' && target.protocol !== 'https:') {
+            return new Response('Only http:// and https:// URLs are allowed', { status: 400 });
+        }
+
+        if (target.username || target.password) {
+            return new Response('Target URL must not include credentials', { status: 400 });
+        }
+
         if (!ALLOWED_HOSTS.has(target.hostname)) {
             return new Response('Hostname not allowed', { status: 403 });
         }
 
         try {
-            const proxyHeaders = new Headers(request.headers);
-            proxyHeaders.delete('host');
+            const proxyHeaders = new Headers();
+            for (const name of ['accept', 'accept-language', 'content-type', 'user-agent']) {
+                const value = request.headers.get(name);
+                if (value) proxyHeaders.set(name, value);
+            }
 
             return await proxy.fetch(target, {
                 method: request.method,
-                headers: Object.fromEntries(proxyHeaders.entries()),
+                headers: proxyHeaders,
                 body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
             }, { timeoutMs: 15000 });
         } catch (err) {

@@ -33,6 +33,7 @@
     "rust-tls-wasm/Cargo.lock",
     "example/",
     "LICENSE",
+    "SECURITY.md",
     "README.md",
     "index.d.ts"
   ],
