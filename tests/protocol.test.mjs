@@ -4,6 +4,13 @@ import { test } from 'node:test';
 
 const encoder = new TextEncoder();
 
+const byteLimits = loadSource('byte-limits.js', [
+  'REQUEST_BODY_LIMIT_ERROR',
+  'RESPONSE_BODY_LIMIT_ERROR',
+  'normalizeOptionalByteLimit',
+  'isByteLimitExceededError',
+]);
+
 function loadSource(file, names, scope = {}) {
   let source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
   source = source
@@ -24,7 +31,7 @@ const http1 = loadSource('proxy-fetch.js', [
   'createDirectStream',
   'writeHttp11Body',
   'buildHttpRequest',
-]);
+], byteLimits);
 
 const h2 = loadSource('proxy-fetch-http2.js', [
   'proxyFetchHttp2',
@@ -50,7 +57,8 @@ const h2 = loadSource('proxy-fetch-http2.js', [
   'FLAG_END_STREAM',
   'FLAG_ACK',
   'FLAG_PADDED',
-]);
+  'writeDataStream',
+], byteLimits);
 
 const tls = loadSource('wasm-tls.js', [
   'advanceRustlsNetworkOffset',
@@ -408,6 +416,31 @@ test('proxyFetch rejects unsupported protocols before dialing', async () => {
   );
 });
 
+test('fetch byte-limit options validate finite safe non-negative integers', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    for (const value of [-1, NaN, Infinity, 1.5]) {
+      await assert.rejects(
+        http1.proxyFetch('http://example.com/', {}, {}, { maxUploadBytes: value }),
+        /socksflare: maxUploadBytes must be a finite safe integer >= 0/,
+      );
+      await assert.rejects(
+        http1.proxyFetch('http://example.com/', {}, {}, { maxResponseBytes: value }),
+        /socksflare: maxResponseBytes must be a finite safe integer >= 0/,
+      );
+    }
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
 test('proxyFetch preserves Request signal and aborts before dialing', async () => {
   const prevSocks5Connect = globalThis.socks5Connect;
   let dialed = false;
@@ -479,6 +512,29 @@ test('Socks5Client.fetch merges Request signal with timeout', async () => {
   }
 });
 
+test('Socks5Client.fetch forwards byte-limit options', async () => {
+  const prevProxyFetch = globalThis.proxyFetch;
+  let seenOptions;
+
+  globalThis.proxyFetch = async (_input, _init, _proxyConfig, options) => {
+    seenOptions = options;
+    return new Response('ok');
+  };
+
+  try {
+    const client = new indexApi.Socks5Client({ host: '127.0.0.1' });
+    await client.fetch('https://example.com/', {}, {
+      maxUploadBytes: 10,
+      maxResponseBytes: 20,
+    });
+
+    assert.equal(seenOptions.maxUploadBytes, 10);
+    assert.equal(seenOptions.maxResponseBytes, 20);
+  } finally {
+    globalThis.proxyFetch = prevProxyFetch;
+  }
+});
+
 test('proxyFetch auto falls back to HTTP/1.1 only when HTTP/2 ALPN negotiation fails', async () => {
   const prevProxyFetchHttp2 = globalThis.proxyFetchHttp2;
   const prevSocks5Connect = globalThis.socks5Connect;
@@ -544,6 +600,151 @@ test('HTTP/1.1 rejects GET request body before dialing', async () => {
   } finally {
     globalThis.socks5Connect = prevSocks5Connect;
   }
+});
+
+test('HTTP/1.1 byte request body over maxUploadBytes rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      http1.proxyFetch('http://example.com/', { method: 'POST', body: 'hello' }, {}, { maxUploadBytes: 4 }),
+      new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR),
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/1.1 byte request body at maxUploadBytes succeeds', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  globalThis.socks5Connect = async () => fakeTunnel([
+    'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',
+  ]);
+
+  try {
+    const res = await http1.proxyFetch(
+      'http://example.com/',
+      { method: 'POST', body: 'test' },
+      {},
+      { maxUploadBytes: 4 },
+    );
+    assert.equal(await res.text(), 'ok');
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/1.1 stream request body over maxUploadBytes rejects and cancels source', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let tunnel;
+  let cancelReason = null;
+  let dialed = false;
+  const chunks = [bytes('abc'), bytes('def')];
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) controller.enqueue(chunks[index++]);
+    },
+    cancel(reason) {
+      cancelReason = reason;
+    },
+  });
+
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    tunnel = fakeTunnel(['HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok']);
+    return tunnel;
+  };
+
+  try {
+    await assert.rejects(
+      http1.proxyFetch(
+        'http://example.com/',
+        { method: 'POST', body },
+        {},
+        { maxUploadBytes: 5 },
+      ),
+      new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR),
+    );
+    assert.equal(dialed, true);
+    assert.match(cancelReason?.message ?? '', new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR));
+    assert.equal(tunnel.socket.closed, true);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/1.1 stream request body exactly maxUploadBytes succeeds', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let cancelCalled = false;
+  const chunks = [bytes('abc'), bytes('de')];
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]);
+        if (index >= chunks.length) controller.close();
+      }
+    },
+    cancel() {
+      cancelCalled = true;
+    },
+  });
+
+  globalThis.socks5Connect = async () => fakeTunnel([
+    'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok',
+  ]);
+
+  try {
+    const res = await http1.proxyFetch(
+      'http://example.com/',
+      { method: 'POST', body },
+      {},
+      { maxUploadBytes: 5 },
+    );
+    assert.equal(await res.text(), 'ok');
+    assert.equal(cancelCalled, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/1.1 Content-Length response over maxResponseBytes rejects', async () => {
+  const socket = fakeSocket();
+  await assert.rejects(
+    http1.parseResponseBinary(
+      streamFromChunks(['HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello']),
+      socket,
+      null,
+      'GET',
+      4,
+    ),
+    new RegExp(byteLimits.RESPONSE_BODY_LIMIT_ERROR),
+  );
+  assert.equal(socket.closed, true);
+});
+
+test('HTTP/1.1 chunked response errors when streamed bytes exceed maxResponseBytes', async () => {
+  const socket = fakeSocket();
+  const res = await http1.parseResponseBinary(
+    streamFromChunks(['HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n3\r\nbye\r\n0\r\n\r\n']),
+    socket,
+    null,
+    'GET',
+    4,
+  );
+
+  await assert.rejects(
+    withTimeout(res.text()),
+    new RegExp(byteLimits.RESPONSE_BODY_LIMIT_ERROR),
+  );
+  assert.equal(socket.closed, true);
 });
 
 test('SOCKS5 rejects unsupported selected auth method 0x01', async () => {
@@ -1499,6 +1700,109 @@ test('HTTP/2 unsupported body object rejects before dialing', async () => {
   }
 });
 
+test('HTTP/2 byte request body over maxUploadBytes rejects before dialing', async () => {
+  const prevSocks5Connect = globalThis.socks5Connect;
+  let dialed = false;
+  globalThis.socks5Connect = async () => {
+    dialed = true;
+    return fakeTunnel([]);
+  };
+
+  try {
+    await assert.rejects(
+      h2.proxyFetchHttp2(
+        new URL('https://example.com/'),
+        { method: 'POST', body: 'hello' },
+        {},
+        { maxUploadBytes: 4 },
+      ),
+      new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR),
+    );
+    assert.equal(dialed, false);
+  } finally {
+    globalThis.socks5Connect = prevSocks5Connect;
+  }
+});
+
+test('HTTP/2 stream request body over maxUploadBytes rejects and cancels source', async () => {
+  const writes = [];
+  let cancelReason = null;
+  const chunks = [bytes('abc'), bytes('def')];
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) controller.enqueue(chunks[index++]);
+    },
+    cancel(reason) {
+      cancelReason = reason;
+    },
+  });
+
+  await assert.rejects(
+    h2.writeDataStream(
+      {
+        write(frame) {
+          writes.push(frame);
+          return Promise.resolve();
+        },
+      },
+      {
+        waitForCredits(_streamId, remaining) {
+          return Promise.resolve(remaining);
+        },
+      },
+      1,
+      body,
+      null,
+      5,
+    ),
+    new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR),
+  );
+
+  assert.match(cancelReason?.message ?? '', new RegExp(byteLimits.REQUEST_BODY_LIMIT_ERROR));
+  assert.equal(writes.some(frame => frame[3] === h2.FRAME_DATA), true);
+  assert.equal(writes.some(frame => frame[3] === h2.FRAME_DATA && (frame[4] & h2.FLAG_END_STREAM) === h2.FLAG_END_STREAM), false);
+});
+
+test('HTTP/2 stream request body exactly maxUploadBytes succeeds', async () => {
+  const writes = [];
+  let cancelCalled = false;
+  const chunks = [bytes('abc'), bytes('de')];
+  let index = 0;
+  const body = new ReadableStream({
+    pull(controller) {
+      if (index < chunks.length) {
+        controller.enqueue(chunks[index++]);
+        if (index >= chunks.length) controller.close();
+      }
+    },
+    cancel() {
+      cancelCalled = true;
+    },
+  });
+
+  await h2.writeDataStream(
+    {
+      write(frame) {
+        writes.push(frame);
+        return Promise.resolve();
+      },
+    },
+    {
+      waitForCredits(_streamId, remaining) {
+        return Promise.resolve(remaining);
+      },
+    },
+    1,
+    body,
+    null,
+    5,
+  );
+
+  assert.equal(cancelCalled, false);
+  assert.equal(writes.some(frame => frame[3] === h2.FRAME_DATA && (frame[4] & h2.FLAG_END_STREAM) === h2.FLAG_END_STREAM), true);
+});
+
 test('HTTP/2 invalid request header name rejects', () => {
   const fakeUrl = new URL('https://example.com/');
   const bodyMode = { kind: 'none' };
@@ -1864,6 +2168,48 @@ test('HTTP/2 sends WINDOW_UPDATE after body writer resolves', async () => {
   releaseWrite();
   await framePromise;
   assert.equal(writes.some(frame => frame[3] === h2.FRAME_WINDOW_UPDATE), true);
+});
+
+test('HTTP/2 response DATA over maxResponseBytes errors body stream', async () => {
+  const { conn, socket } = h2Conn();
+
+  const fetchPromise = conn.fetch(
+    new URL('https://example.com/'),
+    { method: 'GET' },
+    { method: 'GET', bodyMode: { kind: 'none' }, maxResponseBytes: 3 },
+  );
+
+  await Promise.resolve();
+  await Promise.resolve();
+
+  await conn.handleFrame({
+    type: h2.FRAME_HEADERS,
+    flags: h2.FLAG_END_HEADERS,
+    streamId: 1,
+    payload: h2HeaderBlock([[':status', '200']]),
+  });
+
+  const res = await withTimeout(fetchPromise);
+  const textPromise = withTimeout(res.text());
+
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: 0,
+    streamId: 1,
+    payload: bytes('ok'),
+  });
+  await conn.handleFrame({
+    type: h2.FRAME_DATA,
+    flags: h2.FLAG_END_STREAM,
+    streamId: 1,
+    payload: bytes('!!'),
+  });
+
+  await assert.rejects(
+    textPromise,
+    new RegExp(byteLimits.RESPONSE_BODY_LIMIT_ERROR),
+  );
+  assert.equal(socket.closed, true);
 });
 
 test('HTTP/2 padded DATA refunds full flow-controlled length', async () => {

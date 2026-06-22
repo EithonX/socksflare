@@ -158,11 +158,23 @@ const response = await proxy.fetch('https://example.com', {
 | `options.tlsHostname` | `string` | Override SNI hostname for TLS |
 | `options.httpVersion` | `'1.1' \| 'auto' \| '2'` | HTTPS strategy: force HTTP/1.1, try HTTP/2 then fall back only if ALPN does not negotiate `h2`, or require HTTP/2 |
 | `options.timeoutMs` | `number` | Abort after this many milliseconds (uses `AbortSignal.timeout()` when available, with fallback timer wiring otherwise) |
+| `options.maxUploadBytes` | `number` | Optional request-body guard. Rejects or aborts uploads after this many bytes |
+| `options.maxResponseBytes` | `number` | Optional response-body guard. Rejects or aborts downloads after this many bytes |
 | `options.extraRootCertificates` | `Array<ArrayBuffer \| Uint8Array>` | Advanced/testing-only extra DER root certificates for local TLS or private PKI |
 
 `tlsHostname` is advanced-only. Overriding it can intentionally create an SNI/Host mismatch, which some targets reject and some security tools flag.
 
 **Request body support:** `string`, `Uint8Array`, `ArrayBuffer`, typed-array views, `URLSearchParams`, `Blob`, and `ReadableStream`. `FormData` is not supported yet. `GET` and `HEAD` request bodies are rejected.
+
+Optional byte guards help Free-tier Cloudflare Workers stay within tighter memory/egress safety budgets without changing default behavior when omitted.
+
+```javascript
+const response = await proxy.fetch('https://example.com/file', {}, {
+  timeoutMs: 15000,
+  maxUploadBytes: 10 * 1024 * 1024,
+  maxResponseBytes: 50 * 1024 * 1024,
+});
+```
 
 **HTTP/2:** per-request HTTP/2 implementation. Each `proxy.fetch()` opens a fresh SOCKS5/TLS tunnel, so one HTTP/2 request stream is used per connection by design. Socksflare does not currently pool or multiplex multiple fetches over one shared HTTP/2 connection. For maximum compatibility, `httpVersion: '1.1'` remains safest; `httpVersion: 'auto'` or `'2'` can use H2 when your target supports it.
 
@@ -248,7 +260,8 @@ socksflare/
 │   ├── socks5-client.js     ← SOCKS5 handshake engine
 │   ├── proxy-fetch.js       ← Fetch dispatcher + HTTP/1.1 path
 │   ├── proxy-fetch-http2.js ← Per-request HTTP/2 path
-│   └── wasm-tls.js          ← JS bridge to Rustls WASM
+│   ├── wasm-tls.js          ← JS bridge to Rustls WASM
+│   └── byte-limits.js       ← Shared byte-limit validation + errors
 ├── tests/
 │   ├── protocol.test.mjs    ← Protocol/unit coverage
 │   ├── integration.test.mjs ← Local SOCKS5 + HTTP integration harness

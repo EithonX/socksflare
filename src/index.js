@@ -67,6 +67,8 @@ export class Socks5Client {
      * @param {'1.1'|'auto'|'2'} [options.httpVersion='1.1'] - HTTP version strategy for HTTPS targets.
      * @param {Array<ArrayBuffer|Uint8Array>} [options.extraRootCertificates] - Optional extra DER roots.
      * @param {number} [options.timeoutMs] - Abort after this many ms (merged with init.signal if present).
+     * @param {number} [options.maxUploadBytes] - Optional request-body byte guard.
+     * @param {number} [options.maxResponseBytes] - Optional response-body byte guard.
      * @returns {Promise<Response>}
      */
     async fetch(input, init = {}, options = {}) {
@@ -85,6 +87,8 @@ export class Socks5Client {
             tlsHostname: options.tlsHostname,
             httpVersion: options.httpVersion,
             extraRootCertificates: options.extraRootCertificates,
+            maxUploadBytes: options.maxUploadBytes,
+            maxResponseBytes: options.maxResponseBytes,
         });
     }
 

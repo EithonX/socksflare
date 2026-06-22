@@ -9,6 +9,7 @@
  */
 
 import { socks5Connect } from './socks5-client.js';
+import { REQUEST_BODY_LIMIT_ERROR, RESPONSE_BODY_LIMIT_ERROR, normalizeOptionalByteLimit } from './byte-limits.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -154,6 +155,11 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const tlsHostname = options.tlsHostname || targetHost;
     const method = normalizeRequestMethod(requestInit.method, 'HTTP/2');
     const bodyMode = await prepareRequestBody(method, requestInit.body, 'HTTP/2');
+    const maxUploadBytes = normalizeOptionalByteLimit(options.maxUploadBytes, 'maxUploadBytes');
+    const maxResponseBytes = normalizeOptionalByteLimit(options.maxResponseBytes, 'maxResponseBytes');
+    if (maxUploadBytes !== null && bodyMode.kind === 'bytes' && bodyMode.bytes.byteLength > maxUploadBytes) {
+        throw new Error(REQUEST_BODY_LIMIT_ERROR);
+    }
 
     const tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
         enableTls: true,
@@ -174,7 +180,7 @@ export async function proxyFetchHttp2(url, requestInit = {}, proxyConfig, option
     const conn = new Http2SingleConnection(tunnel, requestInit.signal);
     try {
         await conn.init();
-        return await conn.fetch(url, requestInit, { method, bodyMode });
+        return await conn.fetch(url, requestInit, { method, bodyMode, maxUploadBytes, maxResponseBytes });
     } catch (err) {
         conn.close(err);
         throw err;
@@ -215,9 +221,12 @@ class Http2SingleConnection {
 
         const method = prepared?.method || normalizeRequestMethod(requestInit.method, 'HTTP/2');
         const bodyMode = prepared?.bodyMode || await prepareRequestBody(method, requestInit.body, 'HTTP/2');
+        const maxUploadBytes = prepared?.maxUploadBytes ?? null;
+        const maxResponseBytes = prepared?.maxResponseBytes ?? null;
         const streamId = 1;
         const stream = this.createStreamState(streamId);
         stream.method = method;
+        stream.maxResponseBytes = maxResponseBytes;
         this.streams.set(streamId, stream);
         this.windowTracker.streamWindows.set(streamId, this.windowTracker.initialWindowSize);
         const encodedHeaders = encodeRequestHeaderBlock(buildRequestHeaders(url, requestInit, method, bodyMode));
@@ -226,8 +235,8 @@ class Http2SingleConnection {
         await writeHeaderBlock(this.frameWriter, streamId, encodedHeaders, !hasBody);
         const uploadPromise = hasBody
             ? (bodyMode.kind === 'bytes'
-                ? writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true, requestInit.signal)
-                : writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream, requestInit.signal))
+                ? writeDataBytes(this.frameWriter, this.windowTracker, streamId, bodyMode.bytes, true, requestInit.signal, maxUploadBytes)
+                : writeDataStream(this.frameWriter, this.windowTracker, streamId, bodyMode.stream, requestInit.signal, maxUploadBytes))
             : Promise.resolve();
         uploadPromise.catch(err => this.failStream(stream, toError(err)));
 
@@ -259,6 +268,7 @@ class Http2SingleConnection {
             headerSeen: false,
             contentLength: null,
             receivedBytes: 0,
+            maxResponseBytes: null,
             nullBody: false,
             trailersSeen: false,
             bodyReadable: null,
@@ -372,6 +382,10 @@ class Http2SingleConnection {
                 stream.headerSeen = true;
                 stream.contentLength = meta.contentLength;
                 stream.nullBody = isNullBodyResponse(stream.method, meta.status);
+                if (!stream.nullBody && stream.maxResponseBytes !== null && stream.contentLength !== null && stream.contentLength > stream.maxResponseBytes) {
+                    this.failStream(stream, new Error(RESPONSE_BODY_LIMIT_ERROR));
+                    return;
+                }
                 if (endStream && !stream.nullBody && stream.contentLength !== null && stream.contentLength !== 0) {
                     this.failStream(stream, new Error('HTTP/2 response body truncated'));
                     return;
@@ -417,6 +431,10 @@ class Http2SingleConnection {
             stream.receivedBytes += parsed.data.byteLength;
             if (stream.contentLength !== null && stream.receivedBytes > stream.contentLength) {
                 this.failStream(stream, new Error('HTTP/2 response body exceeded Content-Length'));
+                return;
+            }
+            if (stream.maxResponseBytes !== null && stream.receivedBytes > stream.maxResponseBytes) {
+                this.failStream(stream, new Error(RESPONSE_BODY_LIMIT_ERROR));
                 return;
             }
             await stream.bodyWriter.write(parsed.data);
@@ -1361,9 +1379,12 @@ async function writeHeaderBlock(writer, streamId, headerBlock, endStream) {
     }
 }
 
-async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream, signal) {
+async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream, signal, maxUploadBytes = null) {
     if (!(bytes instanceof Uint8Array)) {
         bytes = new Uint8Array(bytes);
+    }
+    if (maxUploadBytes !== null && bytes.byteLength > maxUploadBytes) {
+        throw new Error(REQUEST_BODY_LIMIT_ERROR);
     }
 
     let offset = 0;
@@ -1383,9 +1404,10 @@ async function writeDataBytes(writer, windowTracker, streamId, bytes, endStream,
     }
 }
 
-async function writeDataStream(writer, windowTracker, streamId, stream, signal) {
+async function writeDataStream(writer, windowTracker, streamId, stream, signal, maxUploadBytes = null) {
     const reader = stream.getReader();
     let abortHandler = null;
+    let uploadedBytes = 0;
     try {
         if (signal) {
             abortHandler = () => {
@@ -1398,7 +1420,13 @@ async function writeDataStream(writer, windowTracker, streamId, stream, signal) 
             const { done, value } = await reader.read();
             if (done) break;
             const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-            await writeDataBytes(writer, windowTracker, streamId, chunk, false, signal);
+            uploadedBytes += chunk.byteLength;
+            if (maxUploadBytes !== null && uploadedBytes > maxUploadBytes) {
+                const err = new Error(REQUEST_BODY_LIMIT_ERROR);
+                try { await reader.cancel(err); } catch (_) { /* noop */ }
+                throw err;
+            }
+            await writeDataBytes(writer, windowTracker, streamId, chunk, false, signal, null);
         }
         throwIfAborted(signal);
         await writeFrame(writer, FRAME_DATA, FLAG_END_STREAM, streamId, new Uint8Array(0));

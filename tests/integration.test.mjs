@@ -145,6 +145,13 @@ async function nodeTlsHandshake(networkReadable, networkWritable, tlsHostname, o
   });
 }
 
+const byteLimits = loadSource('byte-limits.js', [
+  'REQUEST_BODY_LIMIT_ERROR',
+  'RESPONSE_BODY_LIMIT_ERROR',
+  'normalizeOptionalByteLimit',
+  'isByteLimitExceededError',
+]);
+
 const { socks5Connect } = loadSource('socks5-client.js', ['socks5Connect'], {
   connect: nodeConnect,
   wasmTlsHandshake: nodeTlsHandshake,
@@ -152,11 +159,13 @@ const { socks5Connect } = loadSource('socks5-client.js', ['socks5Connect'], {
 
 const { proxyFetchHttp2 } = loadSource('proxy-fetch-http2.js', ['proxyFetchHttp2'], {
   socks5Connect,
+  ...byteLimits,
 });
 
 const { proxyFetch } = loadSource('proxy-fetch.js', ['proxyFetch'], {
   socks5Connect,
   proxyFetchHttp2,
+  ...byteLimits,
 });
 
 class SocketReader {

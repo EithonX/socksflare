@@ -35,6 +35,16 @@ export interface SocksflareFetchOptions {
   timeoutMs?: number;
 
   /**
+   * Rejects or aborts request bodies after this many bytes.
+   */
+  maxUploadBytes?: number;
+
+  /**
+   * Rejects or aborts response bodies after this many bytes.
+   */
+  maxResponseBytes?: number;
+
+  /**
    * Optional extra DER root certificates for advanced/local TLS testing.
    */
   extraRootCertificates?: Array<ArrayBuffer | Uint8Array>;

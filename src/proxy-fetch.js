@@ -15,6 +15,7 @@
 
 import { socks5Connect } from './socks5-client.js';
 import { proxyFetchHttp2 } from './proxy-fetch-http2.js';
+import { REQUEST_BODY_LIMIT_ERROR, RESPONSE_BODY_LIMIT_ERROR, isByteLimitExceededError, normalizeOptionalByteLimit } from './byte-limits.js';
 
 const CR = 0x0D;
 const LF = 0x0A;
@@ -70,12 +71,16 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
     const requestedVersion = options.httpVersion === '2'
         ? '2'
         : (options.httpVersion === 'auto' ? 'auto' : '1.1');
+    const maxUploadBytes = normalizeOptionalByteLimit(options.maxUploadBytes, 'maxUploadBytes');
+    const maxResponseBytes = normalizeOptionalByteLimit(options.maxResponseBytes, 'maxResponseBytes');
 
     if (isHttps && requestedVersion !== '1.1') {
         try {
             return await proxyFetchHttp2(url, requestInit, proxyConfig, {
                 tlsHostname: options.tlsHostname,
                 extraRootCertificates: options.extraRootCertificates,
+                maxUploadBytes,
+                maxResponseBytes,
             });
         } catch (err) {
             if (requestedVersion === '2' || !shouldFallbackToHttp11(err)) {
@@ -84,7 +89,11 @@ export async function proxyFetch(input, init = {}, proxyConfig, options = {}) {
         }
     }
 
-    return proxyFetchHttp11(url, requestInit, proxyConfig, options);
+    return proxyFetchHttp11(url, requestInit, proxyConfig, {
+        ...options,
+        maxUploadBytes,
+        maxResponseBytes,
+    });
 }
 
 async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
@@ -100,6 +109,9 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
     const method = normalizeRequestMethod(requestInit.method, 'HTTP/1.1');
     const bodyMode = await normalizeHttp11Body(requestInit.body);
     assertMethodBodyAllowed(method, bodyMode, 'HTTP/1.1');
+    if (options.maxUploadBytes !== null && bodyMode.kind === 'bytes' && bodyMode.bytes.byteLength > options.maxUploadBytes) {
+        throw new Error(REQUEST_BODY_LIMIT_ERROR);
+    }
 
     // Establish SOCKS5 tunnel (with WASM TLS if HTTPS)
     tunnel = await socks5Connect(proxyConfig, targetHost, targetPort, {
@@ -123,9 +135,10 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
         const writer = tunnel.writable.getWriter();
         try {
             await writer.write(requestBytes);
-            await writeHttp11Body(writer, bodyMode, signal);
+            await writeHttp11Body(writer, bodyMode, signal, options.maxUploadBytes);
         } catch (err) {
             if (signal && signal.aborted) throw makeAbortError(signal);
+            if (isByteLimitExceededError(err)) throw err;
             const msg = err && err.message ? err.message : String(err);
             throw new Error(`Failed writing HTTP request: ${msg}`);
         } finally {
@@ -134,7 +147,7 @@ async function proxyFetchHttp11(url, requestInit, proxyConfig, options = {}) {
 
         // Parse response — binary header scanning, then stream body
         if (signal) signal.removeEventListener('abort', abortHandler);
-        return await parseResponseBinary(tunnel.readable, tunnel.socket, signal, method);
+        return await parseResponseBinary(tunnel.readable, tunnel.socket, signal, method, options.maxResponseBytes);
 
     } catch (err) {
         if (signal) signal.removeEventListener('abort', abortHandler);
@@ -209,7 +222,7 @@ function buildHttpRequest(url, init, method, bodyMode) {
 
 // ─── Binary HTTP Response Parser ────────────────────────────────────
 
-async function parseResponseBinary(readable, socket, signal, method = 'GET') {
+async function parseResponseBinary(readable, socket, signal, method = 'GET', maxResponseBytes = null) {
     const reader = readable.getReader();
     const decoder = new TextDecoder();
     let abortHandler = null;
@@ -341,17 +354,23 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
     // ── Determine body strategy ──
     const transferEncoding = parseTransferEncoding(responseHeaders.get('transfer-encoding'));
     const contentLength = parseStrictContentLength(contentLengthValues);
+    if (maxResponseBytes !== null && contentLength !== null && contentLength > maxResponseBytes) {
+        cleanupAbort();
+        reader.cancel().catch(() => { });
+        try { socket.close(); } catch (_) { /* noop */ }
+        throw new Error(RESPONSE_BODY_LIMIT_ERROR);
+    }
 
     let bodyStream;
 
     if (transferEncoding === 'chunked') {
-        bodyStream = createChunkedStream(reader, bodyRemainder, socket, signal, cleanupAbort);
+        bodyStream = createChunkedStream(reader, bodyRemainder, socket, signal, cleanupAbort, maxResponseBytes);
         responseHeaders.delete('transfer-encoding');
         responseHeaders.delete('content-length');
     } else if (contentLength !== null && contentLength >= 0) {
-        bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket, signal, cleanupAbort);
+        bodyStream = createContentLengthStream(reader, bodyRemainder, contentLength, socket, signal, cleanupAbort, maxResponseBytes);
     } else {
-        bodyStream = createDirectStream(reader, bodyRemainder, socket, signal, cleanupAbort);
+        bodyStream = createDirectStream(reader, bodyRemainder, socket, signal, cleanupAbort, maxResponseBytes);
     }
 
     return new Response(bodyStream, { status, statusText, headers: responseHeaders });
@@ -362,9 +381,10 @@ async function parseResponseBinary(readable, socket, signal, method = 'GET') {
 /**
  * Content-Length stream — reads exactly `contentLength` bytes then closes.
  */
-function createContentLengthStream(reader, initialData, contentLength, socket, signal, cleanup) {
+function createContentLengthStream(reader, initialData, contentLength, socket, signal, cleanup, maxResponseBytes = null) {
     let bytesRemaining = contentLength;
     let sentInitial = false;
+    const limitEnqueuer = createResponseLimitEnqueuer(maxResponseBytes, socket, cleanup);
 
     return new ReadableStream({
         pull(controller) {
@@ -380,7 +400,7 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
                 sentInitial = true;
                 if (initialData.byteLength > 0) {
                     if (initialData.byteLength >= bytesRemaining) {
-                        controller.enqueue(initialData.subarray(0, bytesRemaining));
+                        if (!limitEnqueuer.enqueue(controller, initialData.subarray(0, bytesRemaining))) return;
                         bytesRemaining = 0;
                         controller.close();
                         cleanup();
@@ -388,7 +408,7 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
                         return;
                     }
                     bytesRemaining -= initialData.byteLength;
-                    controller.enqueue(initialData);
+                    if (!limitEnqueuer.enqueue(controller, initialData)) return;
                     return;
                 }
             }
@@ -402,14 +422,14 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
                     return;
                 }
                 if (value.byteLength >= bytesRemaining) {
-                    controller.enqueue(value.subarray(0, bytesRemaining));
+                    if (!limitEnqueuer.enqueue(controller, value.subarray(0, bytesRemaining))) return;
                     bytesRemaining = 0;
                     controller.close();
                     cleanup();
                     try { socket.close(); } catch (_) { /* noop */ }
                 } else {
                     bytesRemaining -= value.byteLength;
-                    controller.enqueue(value);
+                    limitEnqueuer.enqueue(controller, value);
                 }
             }).catch(() => {
                 cleanup();
@@ -430,10 +450,11 @@ function createContentLengthStream(reader, initialData, contentLength, socket, s
 /**
  * Chunked transfer encoding decoder — fully binary.
  */
-function createChunkedStream(reader, initialData, socket, signal, cleanup) {
+function createChunkedStream(reader, initialData, socket, signal, cleanup, maxResponseBytes = null) {
     let buffer = initialData;
     let streamDone = false;
     const chunkDecoder = new TextDecoder();
+    const limitEnqueuer = createResponseLimitEnqueuer(maxResponseBytes, socket, cleanup);
 
     const failWith = (controller, err) => {
         streamDone = true;
@@ -528,7 +549,7 @@ function createChunkedStream(reader, initialData, socket, signal, cleanup) {
                 const chunkData = buffer.subarray(0, chunkSize);
                 buffer = buffer.subarray(chunkSize + 2);
 
-                controller.enqueue(chunkData);
+                if (!limitEnqueuer.enqueue(controller, chunkData)) return;
                 return;
             }
         },
@@ -543,15 +564,16 @@ function createChunkedStream(reader, initialData, socket, signal, cleanup) {
 /**
  * Direct stream — pipe until close (no Content-Length, not chunked).
  */
-function createDirectStream(reader, initialData, socket, signal, cleanup) {
+function createDirectStream(reader, initialData, socket, signal, cleanup, maxResponseBytes = null) {
     let sentInitial = false;
+    const limitEnqueuer = createResponseLimitEnqueuer(maxResponseBytes, socket, cleanup);
     return new ReadableStream({
         pull(controller) {
             throwIfAborted(signal);
             if (!sentInitial) {
                 sentInitial = true;
                 if (initialData.byteLength > 0) {
-                    controller.enqueue(initialData);
+                    if (!limitEnqueuer.enqueue(controller, initialData)) return;
                     return;
                 }
             }
@@ -565,7 +587,7 @@ function createDirectStream(reader, initialData, socket, signal, cleanup) {
                 if (value && value.byteLength === 0) {
                     return;
                 }
-                controller.enqueue(value);
+                limitEnqueuer.enqueue(controller, value);
             }).catch((err) => {
                 cleanup();
                 try { socket.close(); } catch (_) { /* noop */ }
@@ -601,16 +623,20 @@ async function normalizeHttp11Body(body) {
     throw new Error(`Unsupported request body type: ${Object.prototype.toString.call(body)}`);
 }
 
-async function writeHttp11Body(writer, bodyMode, signal) {
+async function writeHttp11Body(writer, bodyMode, signal, maxUploadBytes = null) {
     throwIfAborted(signal);
     if (bodyMode.kind === 'none') return;
     if (bodyMode.kind === 'bytes') {
+        if (maxUploadBytes !== null && bodyMode.bytes.byteLength > maxUploadBytes) {
+            throw new Error(REQUEST_BODY_LIMIT_ERROR);
+        }
         if (bodyMode.bytes.byteLength > 0) await writer.write(bodyMode.bytes);
         return;
     }
 
     const reader = bodyMode.stream.getReader();
     let abortHandler = null;
+    let uploadedBytes = 0;
     try {
         if (signal) {
             abortHandler = () => {
@@ -624,6 +650,12 @@ async function writeHttp11Body(writer, bodyMode, signal) {
             if (done) break;
             const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
             if (chunk.byteLength === 0) continue;
+            uploadedBytes += chunk.byteLength;
+            if (maxUploadBytes !== null && uploadedBytes > maxUploadBytes) {
+                const err = new Error(REQUEST_BODY_LIMIT_ERROR);
+                try { await reader.cancel(err); } catch (_) { /* noop */ }
+                throw err;
+            }
             await writer.write(textEncoder.encode(`${chunk.byteLength.toString(16)}\r\n`));
             await writer.write(chunk);
             await writer.write(textEncoder.encode('\r\n'));
@@ -668,6 +700,24 @@ function toError(err) {
 
 function throwIfAborted(signal) {
     if (signal && signal.aborted) throw makeAbortError(signal);
+}
+
+function createResponseLimitEnqueuer(maxResponseBytes, socket, cleanup) {
+    let emittedBytes = 0;
+    return {
+        enqueue(controller, chunk) {
+            if (!chunk || chunk.byteLength === 0) return true;
+            emittedBytes += chunk.byteLength;
+            if (maxResponseBytes !== null && emittedBytes > maxResponseBytes) {
+                cleanup();
+                try { socket.close(); } catch (_) { /* noop */ }
+                controller.error(new Error(RESPONSE_BODY_LIMIT_ERROR));
+                return false;
+            }
+            controller.enqueue(chunk);
+            return true;
+        },
+    };
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
